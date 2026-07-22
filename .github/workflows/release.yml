@@ -1,0 +1,254 @@
+name: Release
+
+# Production binaries for the forked grok-build (plugin-hooks-on-spawn patch).
+# Targets: macOS Apple Silicon, Windows x86_64, Windows ARM64.
+#
+# Trigger:
+#   - push tag v*  (e.g. v0.2.110-plugin-hooks.1)
+#   - workflow_dispatch with optional tag input
+#
+# Adapted from common Rust CLI release practice + Skylence skyline/skybox
+# release shape (checksums + GitHub Release), but GitHub-hosted runners only.
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag (e.g. v0.2.110-plugin-hooks.1). Leave empty to use the current commit SHA as title only (no create unless tag exists).'
+        required: false
+        type: string
+
+permissions:
+  contents: write
+  id-token: write
+  attestations: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: '0'
+
+jobs:
+  build:
+    name: build (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: macos-aarch64
+            os: macos-14
+            target: aarch64-apple-darwin
+            bin: xai-grok-pager
+            asset: grok-macos-aarch64
+            archive: tar.gz
+          - name: windows-x86_64
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+            bin: xai-grok-pager.exe
+            asset: grok-windows-x86_64
+            archive: zip
+          - name: windows-aarch64
+            os: windows-11-arm
+            target: aarch64-pc-windows-msvc
+            bin: xai-grok-pager.exe
+            asset: grok-windows-aarch64
+            archive: zip
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: '1.92.0'
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release-${{ matrix.target }}
+          cache-targets: true
+
+      - name: Build release binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --release -p xai-grok-pager-bin --locked 2>/dev/null ||             cargo build --release -p xai-grok-pager-bin
+
+      - name: Package artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          src="target/release/${{ matrix.bin }}"
+          if [ ! -f "$src" ]; then
+            echo "::error::missing binary at $src"
+            ls -la target/release/ || true
+            exit 1
+          fi
+
+          # User-facing name matches stock install layout (grok / grok.exe).
+          if [[ "${{ matrix.bin }}" == *.exe ]]; then
+            out_bin="grok.exe"
+          else
+            out_bin="grok"
+          fi
+          cp "$src" "dist/$out_bin"
+          chmod +x "dist/$out_bin" 2>/dev/null || true
+
+          asset="${{ matrix.asset }}"
+          case "${{ matrix.archive }}" in
+            tar.gz)
+              archive="dist/${asset}.tar.gz"
+              tar -C dist -czf "$archive" "$out_bin"
+              ;;
+            zip)
+              archive="dist/${asset}.zip"
+              if command -v zip >/dev/null 2>&1; then
+                (cd dist && zip -q "${asset}.zip" "$out_bin")
+              else
+                powershell -NoProfile -Command "Compress-Archive -LiteralPath (Join-Path 'dist' '$out_bin') -DestinationPath '$archive' -Force"
+              fi
+              ;;
+          esac
+
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "$archive" | tee "${archive}.sha256"
+          else
+            shasum -a 256 "$archive" | tee "${archive}.sha256"
+          fi
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: |
+            dist/${{ matrix.asset }}.*
+          if-no-files-found: error
+          retention-days: 14
+
+  release:
+    name: publish-github-release
+    needs: [build]
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.tag != '')
+    steps:
+      - name: Resolve tag
+        id: ver
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${{ github.ref_type }}" = "tag" ]; then
+            tag="${{ github.ref_name }}"
+          elif [ -n "${{ inputs.tag }}" ]; then
+            tag="${{ inputs.tag }}"
+          else
+            echo "::error::No tag: push a v* tag or pass workflow_dispatch.tag"
+            exit 1
+          fi
+          case "$tag" in
+            v*) ;;
+            *) echo "::error::Tag must start with v (got $tag)"; exit 1 ;;
+          esac
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "version=${tag#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Download all platform artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Flatten + SHA256SUMS
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p release
+          # download-artifact lays out artifacts/<name>/<files>
+          find artifacts -type f \( -name '*.tar.gz' -o -name '*.zip' -o -name '*.sha256' \) -print0             | while IFS= read -r -d '' f; do
+                cp "$f" release/
+              done
+          cd release
+          rm -f SHA256SUMS
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum grok-*.tar.gz grok-*.zip 2>/dev/null | tee SHA256SUMS
+          else
+            shasum -a 256 grok-*.tar.gz grok-*.zip 2>/dev/null | tee SHA256SUMS
+          fi
+          ls -la
+
+      - name: Create or update GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.ver.outputs.tag }}
+          VERSION: ${{ steps.ver.outputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          notes="$RUNNER_TEMP/notes.md"
+          cat > "$notes" <<EOF
+          ## grok ${VERSION} (fork)
+
+          Production builds of [jonasvanderhaegen/grok-build](https://github.com/jonasvanderhaegen/grok-build) with **plugin hooks loaded at session spawn**.
+
+          ### Assets
+
+          | Platform | Asset |
+          |----------|--------|
+          | macOS Apple Silicon | \`grok-macos-aarch64.tar.gz\` |
+          | Windows 11 x64 | \`grok-windows-x86_64.zip\` |
+          | Windows 11 ARM | \`grok-windows-aarch64.zip\` |
+
+          Verify: \`sha256sum -c SHA256SUMS\` (or \`shasum -a 256 -c SHA256SUMS\` on macOS).
+
+          ### Install (macOS Apple Silicon)
+
+          \`\`\`bash
+          curl -fsSL -o /tmp/grok.tgz \
+            "https://github.com/jonasvanderhaegen/grok-build/releases/download/${TAG}/grok-macos-aarch64.tar.gz"
+          mkdir -p ~/.grok/downloads ~/.grok/bin
+          tar -xzf /tmp/grok.tgz -C /tmp
+          install -m 755 /tmp/grok ~/.grok/downloads/grok-${VERSION}-macos-aarch64
+          ln -sfn ~/.grok/downloads/grok-${VERSION}-macos-aarch64 ~/.grok/bin/grok
+          ln -sfn ~/.grok/downloads/grok-${VERSION}-macos-aarch64 ~/.grok/bin/agent
+          ~/.grok/bin/grok --version
+          \`\`\`
+
+          Or: \`bash scripts/install-from-release.sh ${TAG}\`
+
+          ### Install (Windows 11)
+
+          PowerShell (pick the asset for your CPU):
+
+          \`\`\`powershell
+          # x64:  grok-windows-x86_64.zip
+          # ARM:  grok-windows-aarch64.zip
+          .\scripts\install-from-release.ps1 -Tag ${TAG}
+          \`\`\`
+
+          Or manual: download the zip, extract \`grok.exe\` to \`%USERPROFILE%\.grok\bin\\` and put that dir on PATH.
+
+          Start a **new** grok session after install so plugin PreToolUse hooks load at cold start.
+          EOF
+
+          shopt -s nullglob
+          assets=(release/grok-*.tar.gz release/grok-*.zip release/SHA256SUMS)
+          if [ "${#assets[@]}" -lt 2 ]; then
+            echo "::error::expected archives in release/; got: ${assets[*]:-<none>}"
+            find artifacts -type f || true
+            exit 1
+          fi
+
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" --clobber "${assets[@]}"
+            gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --notes-file "$notes"
+          else
+            gh release create "$TAG"               --repo "$GITHUB_REPOSITORY"               --title "grok ${VERSION}"               --notes-file "$notes"               "${assets[@]}"
+          fi
