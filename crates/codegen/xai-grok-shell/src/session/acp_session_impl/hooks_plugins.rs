@@ -650,34 +650,7 @@ impl SessionActor {
         // Clone the Arc out of the RefCell so the borrow is dropped immediately.
         let plugin_registry_snapshot = self.plugin_registry.borrow().clone();
         if let Some(ref pr) = plugin_registry_snapshot {
-            for plugin in pr.active_plugins() {
-                if let Some(ref hooks_path) = plugin.hooks_path {
-                    let (specs, warnings) =
-                        xai_grok_agent::plugins::hooks_adapter::parse_plugin_hooks(
-                            hooks_path,
-                            &plugin.name,
-                            &plugin.root_str(),
-                            &plugin.data_dir_str(),
-                        );
-                    for w in &warnings {
-                        tracing::warn!("{w}");
-                    }
-                    registry.append_specs(specs);
-                }
-                if let Some(ref inline_value) = plugin.inline_hooks {
-                    let (specs, warnings) =
-                        xai_grok_agent::plugins::hooks_adapter::parse_plugin_hooks_from_value(
-                            inline_value,
-                            &plugin.name,
-                            &plugin.root_str(),
-                            &plugin.data_dir_str(),
-                        );
-                    for w in &warnings {
-                        tracing::warn!("{w}");
-                    }
-                    registry.append_specs(specs);
-                }
-            }
+            xai_grok_agent::plugins::append_active_plugin_hooks(&mut registry, pr);
         }
         let hook_count = registry.len();
         {
@@ -848,37 +821,8 @@ impl SessionActor {
         let t_hooks = std::time::Instant::now();
         let mut hooks_reloaded = 0usize;
         if let Some(ref new_registry) = new_registry_snapshot {
-            let mut new_specs = Vec::new();
-            for plugin in new_registry.active_plugins() {
-                // File-based hooks
-                if let Some(ref hooks_path) = plugin.hooks_path {
-                    let (specs, warnings) =
-                        xai_grok_agent::plugins::hooks_adapter::parse_plugin_hooks(
-                            hooks_path,
-                            &plugin.name,
-                            &plugin.root_str(),
-                            &plugin.data_dir_str(),
-                        );
-                    for w in &warnings {
-                        tracing::warn!("{w}");
-                    }
-                    new_specs.extend(specs);
-                }
-                // Inline hooks
-                if let Some(ref inline_value) = plugin.inline_hooks {
-                    let (specs, warnings) =
-                        xai_grok_agent::plugins::hooks_adapter::parse_plugin_hooks_from_value(
-                            inline_value,
-                            &plugin.name,
-                            &plugin.root_str(),
-                            &plugin.data_dir_str(),
-                        );
-                    for w in &warnings {
-                        tracing::warn!("{w}");
-                    }
-                    new_specs.extend(specs);
-                }
-            }
+            let new_specs =
+                xai_grok_agent::plugins::collect_active_plugin_hook_specs(new_registry);
             hooks_reloaded = new_specs.len();
             {
                 let mut reg = self.hook_registry.borrow_mut();
@@ -887,8 +831,7 @@ impl SessionActor {
                     hook_reg.remove_by_prefix("plugin/");
                     hook_reg.append_specs(new_specs);
                 } else if !new_specs.is_empty() {
-                    let (mut new_reg, _) =
-                        xai_grok_hooks::discovery::load_hooks_from_sources(&[], &[]);
+                    let mut new_reg = xai_grok_hooks::discovery::HookRegistry::default();
                     new_reg.append_specs(new_specs);
                     *reg = Some(Arc::new(new_reg));
                 }

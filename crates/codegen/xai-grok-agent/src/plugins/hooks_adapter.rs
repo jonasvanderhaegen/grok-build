@@ -208,6 +208,57 @@ fn process_hooks_content(
     (specs, warnings)
 }
 
+/// Parse hooks from every **active** (enabled + trusted) plugin.
+///
+/// Used at session spawn and on mid-session plugin/hook reload so plugin
+/// PreToolUse enforcement (e.g. skyline-grok) is present without requiring
+/// a manual `/plugins reload` after cold start. Parse warnings are logged.
+pub fn collect_active_plugin_hook_specs(
+    plugins: &super::registry::PluginRegistry,
+) -> Vec<HookSpec> {
+    let mut out = Vec::new();
+    for plugin in plugins.active_plugins() {
+        if let Some(ref hooks_path) = plugin.hooks_path {
+            let (specs, warnings) = parse_plugin_hooks(
+                hooks_path,
+                &plugin.name,
+                &plugin.root_str(),
+                &plugin.data_dir_str(),
+            );
+            for w in &warnings {
+                tracing::warn!("{w}");
+            }
+            out.extend(specs);
+        }
+        if let Some(ref inline_value) = plugin.inline_hooks {
+            let (specs, warnings) = parse_plugin_hooks_from_value(
+                inline_value,
+                &plugin.name,
+                &plugin.root_str(),
+                &plugin.data_dir_str(),
+            );
+            for w in &warnings {
+                tracing::warn!("{w}");
+            }
+            out.extend(specs);
+        }
+    }
+    out
+}
+
+/// Parse hooks from every active plugin and append them to `registry`.
+///
+/// Returns the number of hook specs appended.
+pub fn append_active_plugin_hooks(
+    registry: &mut xai_grok_hooks::discovery::HookRegistry,
+    plugins: &super::registry::PluginRegistry,
+) -> usize {
+    let specs = collect_active_plugin_hook_specs(plugins);
+    let n = specs.len();
+    registry.append_specs(specs);
+    n
+}
+
 /// Pre-filter unsupported event names from a hooks JSON file.
 ///
 /// Parses the JSON, removes event keys from the `"hooks"` object that are

@@ -1142,6 +1142,27 @@ pub(crate) async fn spawn_session_actor(
                 Some(Arc::new(registry))
             }
         };
+    // Plugin hooks (skyline-grok PreToolUse, core-grok judge, etc.) must be
+    // present on cold start. discover_hooks only loads disk/settings sources;
+    // without this merge, enforcement stays inert until /plugins reload.
+    let built_hook_registry = {
+        let mut base = match built_hook_registry {
+            Some(arc) => Arc::try_unwrap(arc).unwrap_or_else(|a| (*a).clone()),
+            None => xai_grok_hooks::discovery::HookRegistry::default(),
+        };
+        if let Some(ref pr) = plugin_registry {
+            let n = xai_grok_agent::plugins::append_active_plugin_hooks(&mut base, pr);
+            if n > 0 {
+                tracing::info!(plugin_hooks = n, "merged plugin hooks at session spawn");
+            }
+        }
+        if base.is_empty() {
+            None
+        } else {
+            tracing::info!(hook_count = base.len(), "hooks ready for session");
+            Some(Arc::new(base))
+        }
+    };
     let hook_registry_for_handle = built_hook_registry.clone();
     let workspace_ops_for_handle = workspace_ops.clone();
     #[allow(clippy::arc_with_non_send_sync)]
