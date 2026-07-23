@@ -1,7 +1,7 @@
 name: CI
 
-# Targeted tests for the MCP progress / Progressive use_tool path.
-# Runs on GitHub-hosted Ubuntu (faster + cheaper than local macOS cargo).
+# Fast, targeted tests for MCP progress / Progressive use_tool.
+# GitHub-hosted only — do not run heavy cargo on developer machines.
 #
 # Trigger: push/PR to main, or workflow_dispatch.
 
@@ -22,52 +22,63 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: "0"
-  # RUSTFLAGS left default — pre-existing dead_code warnings in tree
+  CARGO_REGISTRIES_CRATES_IO_PROTOCOL: sparse
+  RUSTC_WRAPPER: sccache
+  SCCACHE_GHA_ENABLED: "true"
+  # mold is installed below; link-arg speeds Linux CI link phase.
+  RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
 
 jobs:
   mcp-progress-tests:
     name: MCP progress unit tests
-    runs-on: ubuntu-latest
-    timeout-minutes: 90
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install protoc
+      - name: Install protoc (prebuilt)
+        shell: bash
+        run: |
+          set -euo pipefail
+          PROTOC_VERSION=28.3
+          curl -fsSL -o /tmp/protoc.zip \
+            "https://github.com/protocolbuffers/protobuf/releases/download/v${PROTOC_VERSION}/protoc-${PROTOC_VERSION}-linux-x86_64.zip"
+          sudo unzip -qo /tmp/protoc.zip -d /usr/local bin/protoc
+          sudo unzip -qo /tmp/protoc.zip -d /usr/local 'include/*'
+          protoc --version
+
+      - name: Install mold linker
+        shell: bash
         run: |
           set -euo pipefail
           sudo apt-get update -qq
-          sudo apt-get install -y -qq protobuf-compiler
-          protoc --version
+          sudo apt-get install -y -qq mold
+          mold --version
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@master
         with:
           toolchain: "1.92.0"
 
-      - name: Cache cargo
+      - name: sccache
+        uses: mozilla-actions/sccache-action@v0.0.9
+
+      - name: Cache cargo registry + target
         uses: Swatinem/rust-cache@v2
         with:
-          shared-key: ci-ubuntu-mcp-progress
+          shared-key: ci-ubuntu-mcp-progress-v2
           cache-targets: true
+          cache-on-failure: true
 
+      # One cargo invocation after shared compile is faster than N separate jobs.
       # Scoped tests only — full workspace is too large for this fork CI.
-      - name: Test use_tool Progress forwarding
+      - name: Test + check (MCP progress path)
+        shell: bash
         run: |
           set -euo pipefail
           cargo test -p xai-grok-tools execute_forwards_progress_before_terminal -- --nocapture
-
-      - name: Test MCP progress display helpers
-        run: |
-          set -euo pipefail
           cargo test -p xai-grok-mcp tool_call_progress -- --nocapture
-
-      - name: Test pager UseTool progress UI
-        run: |
-          set -euo pipefail
           cargo test -p xai-grok-pager progress -- --nocapture
-
-      - name: Check shell + tools + pager + mcp
-        run: |
-          set -euo pipefail
           cargo check -p xai-grok-tools -p xai-grok-shell -p xai-grok-pager -p xai-grok-mcp
+          sccache --show-stats || true

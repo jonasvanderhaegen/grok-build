@@ -1,13 +1,13 @@
 name: Release
 
-# Production binary for the forked grok-build (plugin-hooks-on-spawn patch).
+# Production binary for the forked grok-build (plugin-hooks + MCP progress).
 # Target: macOS Apple Silicon only (aarch64-apple-darwin).
 #
 # Trigger:
-#   - push tag v*  (e.g. v0.2.110-plugin-hooks.1)
-#   - workflow_dispatch with tag input
+#   - push tag v*  (e.g. v0.2.110-mcp-progress.1)
+#   - workflow_dispatch with tag input (builds from selected branch SHA)
 #
-# GitHub-hosted runners only (no self-hosted fleet required).
+# GitHub-hosted runners only — never cargo --release on a developer laptop.
 
 on:
   push:
@@ -16,7 +16,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Release tag (e.g. v0.2.110-plugin-hooks.1)'
+        description: 'Release tag (e.g. v0.2.110-mcp-progress.1)'
         required: true
         type: string
 
@@ -24,18 +24,21 @@ permissions:
   contents: write
 
 concurrency:
-  group: release-${{ github.ref }}
-  cancel-in-progress: false
+  group: release-${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
+  cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: '0'
+  CARGO_REGISTRIES_CRATES_IO_PROTOCOL: sparse
+  RUSTC_WRAPPER: sccache
+  SCCACHE_GHA_ENABLED: 'true'
 
 jobs:
   build-and-release:
     name: build macOS aarch64 + GitHub Release
     runs-on: macos-14
-    timeout-minutes: 360
+    timeout-minutes: 180
     steps:
       - name: Resolve tag
         id: ver
@@ -60,26 +63,37 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
         with:
+          # Tag push: build the tagged commit. Dispatch: build selected branch tip
+          # (so workflow fixes can re-cut a release without retagging).
           ref: ${{ github.ref_type == 'tag' && github.ref_name || github.sha }}
 
-      - name: Install build deps (protoc)
+      - name: Install protoc (prebuilt, skip brew)
         shell: bash
         run: |
           set -euo pipefail
-          # bin/protoc is a dotslash wrapper; CI runners lack both protoc and
-          # dotslash. Homebrew protoc on PATH is enough for xai-proto-build.
-          brew list protobuf &>/dev/null || brew install protobuf
+          # bin/protoc is a dotslash wrapper; runners lack protoc + dotslash.
+          # Prebuilt zip is much faster than `brew install protobuf`.
+          PROTOC_VERSION=28.3
+          curl -fsSL -o /tmp/protoc.zip \
+            "https://github.com/protocolbuffers/protobuf/releases/download/v${PROTOC_VERSION}/protoc-${PROTOC_VERSION}-osx-aarch_64.zip"
+          sudo unzip -qo /tmp/protoc.zip -d /usr/local bin/protoc
+          sudo unzip -qo /tmp/protoc.zip -d /usr/local 'include/*'
           protoc --version
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@master
         with:
           toolchain: '1.92.0'
-      - name: Cache cargo
+
+      - name: sccache
+        uses: mozilla-actions/sccache-action@v0.0.9
+
+      - name: Cache cargo registry + target
         uses: Swatinem/rust-cache@v2
         with:
-          shared-key: release-aarch64-apple-darwin
+          shared-key: release-aarch64-apple-darwin-v2
           cache-targets: true
+          cache-on-failure: true
 
       - name: Build release binary
         shell: bash
@@ -87,6 +101,7 @@ jobs:
           set -euo pipefail
           cargo build --release -p xai-grok-pager-bin --locked 2>/dev/null || \
             cargo build --release -p xai-grok-pager-bin
+          sccache --show-stats || true
 
       - name: Package artifact
         id: pkg
@@ -106,6 +121,16 @@ jobs:
           shasum -a 256 dist/grok-macos-aarch64.tar.gz | tee dist/SHA256SUMS
           ls -la dist/
 
+      - name: Upload build artifact (survives release-notes failures)
+        uses: actions/upload-artifact@v4
+        with:
+          name: grok-macos-aarch64
+          path: |
+            dist/grok-macos-aarch64.tar.gz
+            dist/SHA256SUMS
+          if-no-files-found: error
+          retention-days: 14
+
       - name: Create or update GitHub Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -123,7 +148,7 @@ jobs:
           ### Highlights
 
           - **Plugin hooks loaded at session spawn**
-          - **MCP tools/call progress** through Progressive `use_tool` (live tool-row updates from `notifications/progress`)
+          - **MCP tools/call progress** through Progressive \`use_tool\` (live tool-row updates from \`notifications/progress\`)
 
           ### Asset
 
@@ -154,7 +179,10 @@ jobs:
 
           Start a **new** grok session after install so plugin hooks and MCP progress wiring load at cold start.
           EOF
-          EOF
+
+          # Heredoc above indents with spaces; strip common leading whitespace for clean notes.
+          # (GitHub renders fine either way; strip keeps the download box tidy.)
+          sed -i '' 's/^          //' "$notes" 2>/dev/null || sed -i 's/^          //' "$notes"
 
           assets=(
             dist/grok-macos-aarch64.tar.gz
