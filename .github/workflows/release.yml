@@ -1,7 +1,7 @@
 name: Release
 
-# Production binary for the forked grok-build (plugin-hooks + MCP progress).
-# Target: macOS Apple Silicon only (aarch64-apple-darwin).
+# Production binaries for the forked grok-build (plugin-hooks + MCP progress).
+# Targets: macOS Apple Silicon (aarch64-apple-darwin) + Windows 11 x86_64 (x86_64-pc-windows-msvc).
 #
 # Trigger:
 #   - push tag v*  (e.g. v0.2.110-mcp-progress.1)
@@ -35,10 +35,13 @@ env:
   SCCACHE_GHA_ENABLED: 'true'
 
 jobs:
-  build-and-release:
-    name: build macOS aarch64 + GitHub Release
-    runs-on: macos-14
-    timeout-minutes: 180
+  resolve-tag:
+    name: Resolve tag
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      tag: ${{ steps.ver.outputs.tag }}
+      version: ${{ steps.ver.outputs.version }}
     steps:
       - name: Resolve tag
         id: ver
@@ -60,6 +63,11 @@ jobs:
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
           echo "version=${tag#v}" >> "$GITHUB_OUTPUT"
 
+  build-macos-aarch64:
+    name: build macOS aarch64
+    runs-on: macos-14
+    timeout-minutes: 180
+    steps:
       - name: Checkout
         uses: actions/checkout@v4
         with:
@@ -104,7 +112,6 @@ jobs:
           sccache --show-stats || true
 
       - name: Package artifact
-        id: pkg
         shell: bash
         run: |
           set -euo pipefail
@@ -131,11 +138,115 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
+  build-windows-x86_64:
+    name: build Windows x86_64
+    runs-on: windows-latest
+    timeout-minutes: 180
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref_type == 'tag' && github.ref_name || github.sha }}
+
+      - name: Install protoc (prebuilt)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $version = "28.3"
+          $zip = Join-Path $env:RUNNER_TEMP "protoc.zip"
+          Invoke-WebRequest -Uri "https://github.com/protocolbuffers/protobuf/releases/download/v$version/protoc-$version-win64.zip" -OutFile $zip
+          $dest = Join-Path $env:RUNNER_TEMP "protoc"
+          Expand-Archive -Path $zip -DestinationPath $dest -Force
+          Add-Content -Path $env:GITHUB_PATH -Value (Join-Path $dest "bin")
+          & (Join-Path $dest "bin\protoc.exe") --version
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: '1.92.0'
+
+      - name: sccache
+        uses: mozilla-actions/sccache-action@v0.0.9
+
+      - name: Cache cargo registry + target
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release-x86_64-pc-windows-msvc-v2
+          cache-targets: true
+          cache-on-failure: true
+
+      - name: Build release binary
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          cargo build --release -p xai-grok-pager-bin --locked
+          if ($LASTEXITCODE -ne 0) {
+            cargo build --release -p xai-grok-pager-bin
+          }
+          sccache --show-stats
+
+      - name: Package artifact
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          $src = "target\release\xai-grok-pager.exe"
+          if (-not (Test-Path $src)) {
+            Write-Error "missing binary at $src"
+            Get-ChildItem target\release\
+            exit 1
+          }
+          Copy-Item $src dist\grok.exe -Force
+          Compress-Archive -Path dist\grok.exe -DestinationPath dist\grok-windows-x86_64.zip -Force
+          $hash = (Get-FileHash dist\grok-windows-x86_64.zip -Algorithm SHA256).Hash.ToLower()
+          "$hash  grok-windows-x86_64.zip" | Out-File -FilePath dist\SHA256SUMS -Encoding ascii -NoNewline
+          Add-Content -Path dist\SHA256SUMS -Value ""
+          Get-ChildItem dist
+
+      - name: Upload build artifact (survives release-notes failures)
+        uses: actions/upload-artifact@v4
+        with:
+          name: grok-windows-x86_64
+          path: |
+            dist/grok-windows-x86_64.zip
+            dist/SHA256SUMS
+          if-no-files-found: error
+          retention-days: 14
+
+  publish-release:
+    name: Create or update GitHub Release
+    needs: [resolve-tag, build-macos-aarch64, build-windows-x86_64]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Download macOS artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: grok-macos-aarch64
+          path: dist/macos
+
+      - name: Download Windows artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: grok-windows-x86_64
+          path: dist/windows
+
+      - name: Assemble release assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          cp dist/macos/grok-macos-aarch64.tar.gz dist/
+          cp dist/windows/grok-windows-x86_64.zip dist/
+          cat dist/macos/SHA256SUMS dist/windows/SHA256SUMS > dist/SHA256SUMS
+          ls -la dist/
+          cat dist/SHA256SUMS
+
       - name: Create or update GitHub Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAG: ${{ steps.ver.outputs.tag }}
-          VERSION: ${{ steps.ver.outputs.version }}
+          TAG: ${{ needs.resolve-tag.outputs.tag }}
+          VERSION: ${{ needs.resolve-tag.outputs.version }}
         shell: bash
         run: |
           set -euo pipefail
@@ -155,10 +266,13 @@ jobs:
           | Platform | Asset |
           |----------|--------|
           | macOS Apple Silicon | \`grok-macos-aarch64.tar.gz\` |
+          | Windows 11 x86_64 | \`grok-windows-x86_64.zip\` |
 
-          Verify: \`shasum -a 256 -c SHA256SUMS\`
+          Verify: \`shasum -a 256 -c SHA256SUMS\` (macOS/Linux) or check the matching line in \`SHA256SUMS\` with \`Get-FileHash\` (Windows)
 
           ### Install
+
+          macOS:
 
           \`\`\`bash
           bash scripts/install-from-release.sh ${TAG}
@@ -177,6 +291,12 @@ jobs:
           ~/.grok/bin/grok --version
           \`\`\`
 
+          Windows 11 (x86_64):
+
+          \`\`\`powershell
+          .\scripts\install-from-release.ps1 -Tag ${TAG}
+          \`\`\`
+
           Start a **new** grok session after install so plugin hooks and MCP progress wiring load at cold start.
           EOF
 
@@ -186,6 +306,7 @@ jobs:
 
           assets=(
             dist/grok-macos-aarch64.tar.gz
+            dist/grok-windows-x86_64.zip
             dist/SHA256SUMS
           )
 
