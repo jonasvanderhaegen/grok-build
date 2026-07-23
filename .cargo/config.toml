@@ -59,10 +59,22 @@ rustflags = [
 ]
 
 [target.x86_64-pc-windows-msvc]
-rustflags = ["-C", "force-unwind-tables=yes", "-C", "target-feature=+crt-static"]
+rustflags = [
+    "-C", "force-unwind-tables=yes",
+    "-C", "target-feature=+crt-static",
+    # Large binaries with many generic instantiations overflow the default
+    # 4KB PDB page size, causing `LINK : fatal error LNK4319: A PDB limit
+    # was hit while adding public symbols.` Doubling the page size is the
+    # standard MSVC/rustc workaround.
+    "-C", "link-args=/PDBPAGESIZE:8192",
+]
 
 [target.aarch64-pc-windows-msvc]
-rustflags = ["-C", "force-unwind-tables=yes", "-C", "target-feature=+crt-static"]
+rustflags = [
+    "-C", "force-unwind-tables=yes",
+    "-C", "target-feature=+crt-static",
+    "-C", "link-args=/PDBPAGESIZE:8192",
+]
 
 
 # jemalloc page size for Apple Silicon (macOS aarch64 uses 16KB pages = 2^14).
