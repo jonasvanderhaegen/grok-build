@@ -180,10 +180,15 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
           cargo build --release -p xai-grok-pager-bin --locked
-          if ($LASTEXITCODE -ne 0) {
+          $buildExit = $LASTEXITCODE
+          if ($buildExit -ne 0) {
             cargo build --release -p xai-grok-pager-bin
+            $buildExit = $LASTEXITCODE
           }
           sccache --show-stats
+          if ($buildExit -ne 0) {
+            exit $buildExit
+          }
 
       - name: Package artifact
         shell: pwsh
