@@ -65,15 +65,16 @@ rustflags = [
     # Large binaries with many generic instantiations overflow the default
     # 4KB PDB page size, causing `LINK : fatal error LNK4319: A PDB limit
     # was hit while adding public symbols.` 8192 was not enough for this
-    # binary; 65536 is the maximum value link.exe accepts.
-    "-C", "link-args=/PDBPAGESIZE:65536",
+    # binary; 32768 is the maximum value link.exe accepts (LNK1399 rejects
+    # 65536 — valid values are 4096/8192/16384/32768).
+    "-C", "link-args=/PDBPAGESIZE:32768",
 ]
 
 [target.aarch64-pc-windows-msvc]
 rustflags = [
     "-C", "force-unwind-tables=yes",
     "-C", "target-feature=+crt-static",
-    "-C", "link-args=/PDBPAGESIZE:65536",
+    "-C", "link-args=/PDBPAGESIZE:32768",
 ]
 
 
