@@ -188,4 +188,21 @@ mod tests {
             Some("half (50%)")
         );
     }
+
+    #[test]
+    fn shell_title_format_includes_progress_display() {
+        // Mirrors shell on_progress: "{label}: {text}".
+        let p = notification(3.0, None, Some("waiting on job 7 · 5s"));
+        let tp = tool_progress_from_notification(&p);
+        let text = tool_progress_display_text(&tp).expect("display text");
+        let title = format!("skyline__skyline_run_wait: {text}");
+        assert!(
+            title.contains("waiting on job 7 · 5s"),
+            "title={title}"
+        );
+        assert!(
+            title.starts_with("skyline__skyline_run_wait: "),
+            "title={title}"
+        );
+    }
 }

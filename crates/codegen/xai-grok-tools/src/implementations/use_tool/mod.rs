@@ -62,23 +62,63 @@ crate::register_resource!("grok_build", "UseTool", UseToolParams);
 
 /// Meta tool that dispatches calls to MCP tools discovered via `search_tool`.
 ///
-/// `run()` reads [`InnerDispatch`] from `ToolCallContext::extensions` — set
-/// by `FinalizedToolset::call()` on every call — and dispatches to the target
-/// tool via the runtime `ToolDispatch` trait → `FinalizedToolset::call_raw()`.
-/// This bypasses the outer `ToolBridge` mutex and avoids deadlock.
-/// `call_raw()` skips reminders/persistence so post-processing
-/// runs exactly once (via the outer `call("use_tool")`).
-///
-/// If `InnerDispatch` is absent, dispatch fails with a clear error (should
-/// never happen in production — `FinalizedToolset::call()` always sets it).
-///
-/// The tool exists so its definition appears in the model's tool list —
-/// keeping the tool set stable across turns (no KV cache breaks when new
-/// MCP tools are discovered).
+/// Streaming [`Tool::execute`] reads [`InnerDispatch`] from
+/// `ToolCallContext::extensions` — set by `FinalizedToolset::call()` on every
+/// call — and dispatches to the target tool via the runtime `ToolDispatch`
+/// trait. Progress frames from the target (MCP `notifications/progress`)
+/// are forwarded on the outer stream; the terminal item is the truncated
+/// tool output.
 ///
 /// [`InnerDispatch`]: crate::types::resources::InnerDispatch
 #[derive(Debug, Default)]
 pub struct UseTool;
+
+/// Stream local MCP dispatch, forwarding Progress frames.
+async fn dispatch_local_mcp_stream(
+    dispatch: std::sync::Arc<crate::types::resources::InnerDispatch>,
+    tool_name: &str,
+    tool_input: serde_json::Value,
+    ctx: xai_tool_runtime::ToolCallContext,
+) -> xai_tool_runtime::ToolStream<ToolOutput> {
+    use futures::StreamExt;
+    let tool_id = match xai_tool_protocol::ToolId::new(tool_name) {
+        Ok(id) => id,
+        Err(_) => {
+            return xai_tool_runtime::terminal_only(Err(
+                xai_tool_runtime::ToolError::invalid_arguments(format!(
+                    "invalid tool name: '{tool_name}'"
+                )),
+            ));
+        }
+    };
+    let mut stream = dispatch.0.call(tool_id, tool_input, ctx).await;
+    Box::pin(async_stream::stream! {
+        while let Some(item) = stream.next().await {
+            match item {
+                xai_tool_runtime::ToolStreamItem::Progress(p) => {
+                    yield xai_tool_runtime::ToolStreamItem::Progress(p);
+                }
+                xai_tool_runtime::ToolStreamItem::Terminal(Err(e)) => {
+                    yield xai_tool_runtime::ToolStreamItem::Terminal(Err(e));
+                    return;
+                }
+                xai_tool_runtime::ToolStreamItem::Terminal(Ok(typed)) => {
+                    let output = serde_json::from_value(typed.value).map_err(|e| {
+                        xai_tool_runtime::ToolError::custom("output_decoding", e.to_string())
+                    });
+                    yield xai_tool_runtime::ToolStreamItem::Terminal(output);
+                    return;
+                }
+            }
+        }
+        yield xai_tool_runtime::ToolStreamItem::Terminal(Err(
+            xai_tool_runtime::ToolError::custom(
+                "stream_no_terminal",
+                "dispatch stream ended without a terminal item",
+            ),
+        ));
+    })
+}
 
 async fn dispatch_local_mcp(
     dispatch: std::sync::Arc<crate::types::resources::InnerDispatch>,
@@ -86,12 +126,18 @@ async fn dispatch_local_mcp(
     tool_input: serde_json::Value,
     ctx: xai_tool_runtime::ToolCallContext,
 ) -> Result<ToolOutput, xai_tool_runtime::ToolError> {
-    let tool_id = xai_tool_protocol::ToolId::new(tool_name).map_err(|_| {
-        xai_tool_runtime::ToolError::invalid_arguments(format!("invalid tool name: '{tool_name}'"))
-    })?;
-    let typed = dispatch.0.call_terminal(tool_id, tool_input, ctx).await?;
-    serde_json::from_value(typed.value)
-        .map_err(|e| xai_tool_runtime::ToolError::custom("output_decoding", e.to_string()))
+    use futures::StreamExt;
+    let mut stream = dispatch_local_mcp_stream(dispatch, tool_name, tool_input, ctx).await;
+    while let Some(item) = stream.next().await {
+        match item {
+            xai_tool_runtime::ToolStreamItem::Progress(_) => continue,
+            xai_tool_runtime::ToolStreamItem::Terminal(result) => return result,
+        }
+    }
+    Err(xai_tool_runtime::ToolError::custom(
+        "stream_no_terminal",
+        "dispatch stream ended without a terminal item",
+    ))
 }
 
 fn gateway_result_is_error(result: &serde_json::Value) -> bool {
@@ -310,72 +356,145 @@ impl xai_tool_runtime::Tool for UseTool {
             ..Default::default()
         }
     }
+    fn execute(
+        &self,
+        ctx: xai_tool_runtime::ToolCallContext,
+        input: UseToolInput,
+    ) -> impl std::future::Future<
+            Output = xai_tool_runtime::ToolStream<ToolOutput>
+        > + Send {
+        async move {
+            use crate::types::resources::{
+                EnabledNativeToolNames, ManagedGatewayToolCatalog, Params,
+            };
+            use futures::StreamExt;
+
+            let resources = crate::types::tool_metadata::shared_resources(&ctx).ok();
+            let (gateway_source, is_native, search_tool_name) =
+                if let Some(resources) = resources.as_ref() {
+                    let guard = resources.lock().await;
+                    let gateway_source = guard
+                        .get::<ManagedGatewayToolCatalog>()
+                        .and_then(|catalog| catalog.get(&input.tool_name).cloned());
+                    let correction_enabled = guard
+                        .get::<Params<UseToolParams>>()
+                        .is_none_or(|p| p.0.native_tool_correction);
+                    let native = correction_enabled
+                        && guard
+                            .get::<EnabledNativeToolNames>()
+                            .is_some_and(|set| set.contains(&input.tool_name));
+                    let st = guard
+                        .get::<crate::types::template_renderer::TemplateRenderer>()
+                        .and_then(|r| r.tool_for_kind(ToolKind::SearchTool))
+                        .map(str::to_string)
+                        .unwrap_or_else(|| "search_tool".to_string());
+                    (gateway_source, native, st)
+                } else {
+                    (None, false, "search_tool".to_string())
+                };
+
+            if !input.tool_name.contains("__") && gateway_source.is_none() {
+                let err = if is_native {
+                    tracing::info!(
+                        tool_name = %input.tool_name,
+                        "use_tool: native tool detected, returning corrective error"
+                    );
+                    xai_tool_runtime::ToolError::invalid_arguments(format!(
+                        "`{tool}` is a native tool, not an MCP integration tool. \
+                         Call `{tool}` directly as its own tool call instead of \
+                         routing it through `use_tool`.",
+                        tool = input.tool_name
+                    ))
+                } else {
+                    xai_tool_runtime::ToolError::invalid_arguments(format!(
+                        "'{}' is not a valid MCP tool name. \
+                         Tool names must be qualified as `server__tool` (e.g., `linear__save_issue`). \
+                         Use `{}` to discover available tools.",
+                        input.tool_name, search_tool_name
+                    ))
+                };
+                return xai_tool_runtime::terminal_only(Err(err));
+            }
+
+            // Gateway-managed path: no progress stream available today.
+            if gateway_source.is_some() {
+                let result = async {
+                    let output = dispatch_mcp_tool(
+                        &ctx,
+                        &input.tool_name,
+                        input.tool_input,
+                        "use_tool",
+                    )
+                    .await?;
+                    let trunc_ctx = McpTruncateContext::from_tool_ctx(&ctx, "use_tool").await;
+                    Ok(truncate_tool_output(output, &trunc_ctx).await)
+                }
+                .await;
+                return xai_tool_runtime::terminal_only(result);
+            }
+
+            let Some(dispatch) = ctx
+                .extensions
+                .get::<crate::types::resources::InnerDispatch>()
+            else {
+                return xai_tool_runtime::terminal_only(Err(
+                    xai_tool_runtime::ToolError::invalid_arguments(
+                        "use_tool called outside of tool execution context. inner_dispatch not set -- this is a bug."
+                            .to_string(),
+                    ),
+                ));
+            };
+
+            let tool_name = input.tool_name.clone();
+            let tool_input = normalize_mcp_arguments(input.tool_input);
+            let mut inner =
+                dispatch_local_mcp_stream(dispatch, &tool_name, tool_input, ctx.clone()).await;
+            Box::pin(async_stream::stream! {
+                while let Some(item) = inner.next().await {
+                    match item {
+                        xai_tool_runtime::ToolStreamItem::Progress(p) => {
+                            yield xai_tool_runtime::ToolStreamItem::Progress(p);
+                        }
+                        xai_tool_runtime::ToolStreamItem::Terminal(Err(e)) => {
+                            yield xai_tool_runtime::ToolStreamItem::Terminal(Err(e));
+                            return;
+                        }
+                        xai_tool_runtime::ToolStreamItem::Terminal(Ok(output)) => {
+                            let trunc_ctx =
+                                McpTruncateContext::from_tool_ctx(&ctx, "use_tool").await;
+                            let truncated = truncate_tool_output(output, &trunc_ctx).await;
+                            yield xai_tool_runtime::ToolStreamItem::Terminal(Ok(truncated));
+                            return;
+                        }
+                    }
+                }
+                yield xai_tool_runtime::ToolStreamItem::Terminal(Err(
+                    xai_tool_runtime::ToolError::custom(
+                        "stream_no_terminal",
+                        "use_tool stream ended without a terminal item",
+                    ),
+                ));
+            }) as xai_tool_runtime::ToolStream<ToolOutput>
+        }
+    }
 
     async fn run(
         &self,
         ctx: xai_tool_runtime::ToolCallContext,
         input: UseToolInput,
     ) -> Result<ToolOutput, xai_tool_runtime::ToolError> {
-        use crate::types::resources::{EnabledNativeToolNames, ManagedGatewayToolCatalog, Params};
-
-        let resources = crate::types::tool_metadata::shared_resources(&ctx).ok();
-        let (gateway_source, is_native, search_tool_name) =
-            if let Some(resources) = resources.as_ref() {
-                let guard = resources.lock().await;
-                let gateway_source = guard
-                    .get::<ManagedGatewayToolCatalog>()
-                    .and_then(|catalog| catalog.get(&input.tool_name).cloned());
-                let correction_enabled = guard
-                    .get::<Params<UseToolParams>>()
-                    .is_none_or(|p| p.0.native_tool_correction);
-                let native = correction_enabled
-                    && guard
-                        .get::<EnabledNativeToolNames>()
-                        .is_some_and(|set| set.contains(&input.tool_name));
-                let st = guard
-                    .get::<crate::types::template_renderer::TemplateRenderer>()
-                    .and_then(|r| r.tool_for_kind(ToolKind::SearchTool))
-                    .map(str::to_string)
-                    .unwrap_or_else(|| "search_tool".to_string());
-                (gateway_source, native, st)
-            } else {
-                (None, false, "search_tool".to_string())
-            };
-
-        if !input.tool_name.contains("__") && gateway_source.is_none() {
-            return Err(if is_native {
-                // Native tool wrongly routed through use_tool. Tell the model
-                // to call it directly. Strategy chosen via offline eval over
-                // real production failures:
-                // 2% doom-loop, 86% native recovery, 0 double-schedules.
-                tracing::info!(
-                    tool_name = %input.tool_name,
-                    "use_tool: native tool detected, returning corrective error"
-                );
-                xai_tool_runtime::ToolError::invalid_arguments(format!(
-                    "`{tool}` is a native tool, not an MCP integration tool. \
-                     Call `{tool}` directly as its own tool call instead of \
-                     routing it through `use_tool`.",
-                    tool = input.tool_name
-                ))
-            } else {
-                // Unknown name (e.g. a built-in skill like `jira`). Keep the
-                // existing search_tool steer (empirically reduces retry loops
-                // on unqualified tool names).
-                xai_tool_runtime::ToolError::invalid_arguments(format!(
-                    "'{}' is not a valid MCP tool name. \
-                     Tool names must be qualified as `server__tool` (e.g., `linear__save_issue`). \
-                     Use `{}` to discover available tools.",
-                    input.tool_name, search_tool_name
-                ))
-            });
+        use futures::StreamExt;
+        let mut stream = self.execute(ctx, input).await;
+        while let Some(item) = stream.next().await {
+            match item {
+                xai_tool_runtime::ToolStreamItem::Progress(_) => continue,
+                xai_tool_runtime::ToolStreamItem::Terminal(result) => return result,
+            }
         }
-
-        let output =
-            dispatch_mcp_tool(&ctx, &input.tool_name, input.tool_input, "use_tool").await?;
-
-        let trunc_ctx = McpTruncateContext::from_tool_ctx(&ctx, "use_tool").await;
-        Ok(truncate_tool_output(output, &trunc_ctx).await)
+        Err(xai_tool_runtime::ToolError::custom(
+            "stream_no_terminal",
+            "use_tool stream ended without a terminal item",
+        ))
     }
 }
 
@@ -514,6 +633,75 @@ mod tests {
         let mut ctx = new_ctx();
         ctx.extensions.insert(InnerDispatch(Arc::new(dispatch)));
         ctx
+    }
+
+    /// Yields one Progress frame then a terminal Text output.
+    struct ProgressThenOkDispatch;
+
+    #[async_trait::async_trait]
+    impl xai_tool_runtime::ToolDispatch for ProgressThenOkDispatch {
+        async fn call(
+            &self,
+            tool_id: xai_tool_protocol::ToolId,
+            _args: serde_json::Value,
+            _ctx: xai_tool_runtime::ToolCallContext,
+        ) -> xai_tool_runtime::ToolStream<xai_tool_runtime::TypedToolOutput> {
+            let value = serde_json::to_value(ToolOutput::Text("done".into())).unwrap();
+            let terminal = Ok(xai_tool_runtime::TypedToolOutput::from_value(tool_id, value));
+            Box::pin(async_stream::stream! {
+                yield xai_tool_runtime::ToolStreamItem::Progress(
+                    xai_tool_runtime::ToolProgress::Custom {
+                        subkind: "mcp_progress".into(),
+                        payload: serde_json::json!({
+                            "text": "waiting on job 42",
+                            "message": "waiting on job 42",
+                            "progress": 1.0,
+                            "total": null,
+                        }),
+                    },
+                );
+                yield xai_tool_runtime::ToolStreamItem::Terminal(terminal);
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn execute_forwards_progress_before_terminal() {
+        use futures::StreamExt;
+        let tool = UseTool;
+        let ctx = ctx_with_dispatch(ProgressThenOkDispatch);
+        let mut stream = xai_tool_runtime::Tool::execute(
+            &tool,
+            ctx,
+            UseToolInput {
+                tool_name: "skyline__skyline_run_wait".into(),
+                tool_input: serde_json::json!({"job_id": 42}),
+            },
+        )
+        .await;
+
+        let first = stream.next().await.expect("progress frame");
+        match first {
+            xai_tool_runtime::ToolStreamItem::Progress(
+                xai_tool_runtime::ToolProgress::Custom { subkind, payload },
+            ) => {
+                assert_eq!(subkind, "mcp_progress");
+                assert_eq!(
+                    payload.get("text").and_then(|v| v.as_str()),
+                    Some("waiting on job 42")
+                );
+            }
+            other => panic!("expected Progress, got {other:?}"),
+        }
+
+        let second = stream.next().await.expect("terminal frame");
+        match second {
+            xai_tool_runtime::ToolStreamItem::Terminal(Ok(ToolOutput::Text(t))) => {
+                assert_eq!(t.text, "done");
+            }
+            other => panic!("expected Terminal(Ok(Text)), got {other:?}"),
+        }
+        assert!(stream.next().await.is_none());
     }
 
     #[tokio::test]

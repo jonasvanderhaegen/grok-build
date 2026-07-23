@@ -445,7 +445,12 @@ impl SessionActor {
                             };
                             let mut last_progress_title: Option<String> = None;
                             let tool_call_id = prepared.tool_call_id.clone();
-                            let tool_name = prepared.tool_name.clone();
+                            // Prefer the meta-dispatch target (use_tool → skyline__…)
+                            // so live titles name the real MCP tool, not the wrapper.
+                            let progress_label = prepared
+                                .dispatch_target_name
+                                .clone()
+                                .unwrap_or_else(|| prepared.tool_name.clone());
                             let mut on_progress = |p: xai_tool_runtime::ToolProgress| {
                                 let Some(text) =
                                     xai_grok_mcp::tool_call_progress::tool_progress_display_text(&p)
@@ -455,7 +460,7 @@ impl SessionActor {
                                 if text.trim().is_empty() {
                                     return;
                                 }
-                                let title = format!("{tool_name}: {text}");
+                                let title = format!("{progress_label}: {text}");
                                 if last_progress_title.as_ref() == Some(&title) {
                                     return;
                                 }
@@ -570,7 +575,10 @@ impl SessionActor {
                 if auth_rejected && self.reactive_managed_reauth(&server).await.is_ok() {
                     let mut last_progress_title: Option<String> = None;
                     let tool_call_id = prepared.tool_call_id.clone();
-                    let tool_name = prepared.tool_name.clone();
+                    let progress_label = prepared
+                        .dispatch_target_name
+                        .clone()
+                        .unwrap_or_else(|| prepared.tool_name.clone());
                     let gateway = self.notifications.gateway.clone();
                     let gateway_enabled = self.notifications.gateway_enabled.clone();
                     let acp_session_id = self.session_info.id.clone();
@@ -583,7 +591,7 @@ impl SessionActor {
                         if text.trim().is_empty() {
                             return;
                         }
-                        let title = format!("{tool_name}: {text}");
+                        let title = format!("{progress_label}: {text}");
                         if last_progress_title.as_ref() == Some(&title) {
                             return;
                         }

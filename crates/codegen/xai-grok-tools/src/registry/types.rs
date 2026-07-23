@@ -360,6 +360,13 @@ struct DispatchParts {
     /// `use_tool` target tool name, surfaced in the final `ToolRunResult`.
     effective_tool_name: Option<String>,
 }
+/// Setup for inner/`call_raw` dispatch without outer finalize/reminders.
+struct RawDispatchParts {
+    lr_handle: Arc<dyn xai_computer_hub_core::ToolHandle>,
+    ctx: xai_tool_runtime::ToolCallContext,
+    canonical_params: serde_json::Value,
+    output_converter: OutputConverter,
+}
 /// Per-tool metadata + instance stored in the builder.
 ///
 /// Stores a type-erased dispatch handle (`ToolDispatchHandle`) and
@@ -1217,17 +1224,18 @@ impl Drop for FinalizedToolset {
         }
     }
 }
-/// Calls `FinalizedToolset::call_raw()`, bypassing the outer `ToolBridge`
-/// mutex to avoid deadlock when `use_tool` dispatches to a target MCP tool.
+/// Calls into the local registry for a named tool, bypassing the outer
+/// `ToolBridge` mutex to avoid deadlock when `use_tool` dispatches to a
+/// target MCP tool.
 ///
 /// Stored in [`InnerDispatch`] inside `ToolCallContext::extensions` —
-/// stack-bounded, dropped when `Tool::run()` returns.
+/// stack-bounded, dropped when the outer tool stream ends.
 ///
 /// Implements the canonical `xai_tool_runtime::ToolDispatch` trait so the
-/// dispatch contract is uniform across all boundaries. The impedance
-/// mismatch (`ToolStream<Value>` vs `Result<ToolOutput>`) is bridged by
-/// serializing `ToolOutput` to `Value` in the stream; callers use
-/// `call_terminal()` and deserialize back.
+/// dispatch contract is uniform across all boundaries. Progress frames from
+/// the target tool (including MCP `notifications/progress`) are forwarded;
+/// the terminal item carries a `ToolOutput` JSON value so callers can
+/// deserialize with `serde_json::from_value`.
 struct InnerDispatchForToolset {
     toolset: Arc<FinalizedToolset>,
 }
@@ -1239,20 +1247,66 @@ impl xai_tool_runtime::ToolDispatch for InnerDispatchForToolset {
         args: serde_json::Value,
         ctx: xai_tool_runtime::ToolCallContext,
     ) -> xai_tool_runtime::ToolStream<xai_tool_runtime::TypedToolOutput> {
-        let result = self
-            .toolset
-            .call_raw(tool_id.as_str(), args, ctx)
-            .await
-            .and_then(|output| {
-                let value = serde_json::to_value(&output).map_err(|e| {
-                    xai_tool_runtime::ToolError::custom("output_encoding", e.to_string())
-                })?;
-                Ok(xai_tool_runtime::TypedToolOutput::from_value(
-                    tool_id.clone(),
-                    value,
-                ))
-            });
-        xai_tool_runtime::terminal_only(result)
+        use futures::StreamExt;
+        let toolset = Arc::clone(&self.toolset);
+        let tool_name = tool_id.as_str().to_owned();
+        let out_tool_id = tool_id.clone();
+        Box::pin(async_stream::stream! {
+            let prepared = match toolset.prepare_raw_dispatch(&tool_name, args, ctx) {
+                Ok(p) => p,
+                Err(e) => {
+                    yield xai_tool_runtime::ToolStreamItem::Terminal(Err(e));
+                    return;
+                }
+            };
+            let RawDispatchParts {
+                lr_handle,
+                ctx,
+                canonical_params,
+                output_converter,
+            } = prepared;
+            let mut stream = lr_handle.execute(ctx, canonical_params).await;
+            while let Some(item) = stream.next().await {
+                match item {
+                    xai_tool_runtime::ToolStreamItem::Progress(p) => {
+                        yield xai_tool_runtime::ToolStreamItem::Progress(p);
+                    }
+                    xai_tool_runtime::ToolStreamItem::Terminal(Err(e)) => {
+                        yield xai_tool_runtime::ToolStreamItem::Terminal(Err(e));
+                        return;
+                    }
+                    xai_tool_runtime::ToolStreamItem::Terminal(Ok(typed)) => {
+                        let converted = match (output_converter)(typed.value) {
+                            Ok(output) => serde_json::to_value(&output).map_err(|e| {
+                                xai_tool_runtime::ToolError::custom(
+                                    "output_encoding",
+                                    e.to_string(),
+                                )
+                            }),
+                            Err(e) => Err(xai_tool_runtime::ToolError::custom(
+                                "output_decoding",
+                                e.to_string(),
+                            )),
+                        };
+                        match converted {
+                            Ok(value) => {
+                                yield xai_tool_runtime::ToolStreamItem::Terminal(Ok(
+                                    xai_tool_runtime::TypedToolOutput::from_value(
+                                        out_tool_id.clone(),
+                                        value,
+                                    ),
+                                ));
+                            }
+                            Err(e) => {
+                                yield xai_tool_runtime::ToolStreamItem::Terminal(Err(e));
+                            }
+                        }
+                        return;
+                    }
+                }
+            }
+            yield xai_tool_runtime::ToolStreamItem::Terminal(Err(stream_no_terminal_error()));
+        })
     }
 }
 impl FinalizedToolset {
@@ -1394,12 +1448,12 @@ impl FinalizedToolset {
     /// The `parent_ctx` carries call-id, cwd, resources, etc. from the
     /// outer call. A fresh child context is built from it — stripping
     /// `InnerDispatch` to prevent recursion.
-    async fn call_raw(
+    fn prepare_raw_dispatch(
         &self,
         tool_name: &str,
         tool_args: serde_json::Value,
         parent_ctx: xai_tool_runtime::ToolCallContext,
-    ) -> Result<crate::types::output::ToolOutput, xai_tool_runtime::ToolError> {
+    ) -> Result<RawDispatchParts, xai_tool_runtime::ToolError> {
         let (registry_id, output_converter, reverse_params) = {
             let tools = self.tools.read();
             let entry = tools
@@ -1434,6 +1488,26 @@ impl FinalizedToolset {
                 format!("Tool not found in LocalRegistry: {registry_id}"),
             )
         })?;
+        Ok(RawDispatchParts {
+            lr_handle,
+            ctx,
+            canonical_params,
+            output_converter,
+        })
+    }
+
+    async fn call_raw(
+        &self,
+        tool_name: &str,
+        tool_args: serde_json::Value,
+        parent_ctx: xai_tool_runtime::ToolCallContext,
+    ) -> Result<crate::types::output::ToolOutput, xai_tool_runtime::ToolError> {
+        let RawDispatchParts {
+            lr_handle,
+            ctx,
+            canonical_params,
+            output_converter,
+        } = self.prepare_raw_dispatch(tool_name, tool_args, parent_ctx)?;
         let stream = lr_handle.execute(ctx, canonical_params).await;
         let value = drain_value_stream(stream).await?;
         (output_converter)(value)

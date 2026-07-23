@@ -1,4 +1,4 @@
-# Install forked grok (plugin-hooks-on-spawn)
+# Install forked grok
 
 Prebuilt binary: https://github.com/jonasvanderhaegen/grok-build/releases
 
@@ -6,12 +6,14 @@ Prebuilt binary: https://github.com/jonasvanderhaegen/grok-build/releases
 |----------|--------|
 | macOS Apple Silicon | `grok-macos-aarch64.tar.gz` |
 
+Includes: plugin hooks at session spawn + **MCP tools/call progress** (Progressive `use_tool` path).
+
 ## Install (Mac mini / Apple Silicon)
 
 ```bash
 bash scripts/install-from-release.sh
 # or pin a tag:
-bash scripts/install-from-release.sh v0.2.110-plugin-hooks.1
+bash scripts/install-from-release.sh v0.2.110-mcp-progress.1
 ```
 
 Installs to `~/.grok/downloads/` and symlinks `~/.grok/bin/grok`.
@@ -20,14 +22,17 @@ Installs to `~/.grok/downloads/` and symlinks `~/.grok/bin/grok`.
 
 Start a **new** Grok session so plugin PreToolUse hooks load at cold start (no `/plugins reload`).
 
-## Cutting a release
+## Cutting a release (GitHub Actions — not local cargo)
+
+Heavy builds run on **macos-14** via `.github/workflows/release.yml`:
 
 ```bash
-git tag v0.2.110-plugin-hooks.1
 git push fork main
-git push fork v0.2.110-plugin-hooks.1
+git tag v0.2.110-mcp-progress.1
+git push fork v0.2.110-mcp-progress.1
+# or: Actions → Release → Run workflow (tag input)
 ```
 
-Or: Actions → **Release** → Run workflow (with tag).
+Targeted unit tests run on **ubuntu-latest** via `.github/workflows/ci.yml` on every push to `main`.
 
-Single-job build on `macos-14`. Expect multi-hour wall time on a cold cache.
+Single-job macOS release. Expect multi-hour wall time on a cold cache; warm cache is faster.

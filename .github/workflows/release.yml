@@ -118,7 +118,12 @@ jobs:
           cat > "$notes" <<EOF
           ## grok ${VERSION} (fork)
 
-          Production build of [jonasvanderhaegen/grok-build](https://github.com/jonasvanderhaegen/grok-build) with **plugin hooks loaded at session spawn**.
+          Production build of [jonasvanderhaegen/grok-build](https://github.com/jonasvanderhaegen/grok-build).
+
+          ### Highlights
+
+          - **Plugin hooks loaded at session spawn**
+          - **MCP tools/call progress** through Progressive `use_tool` (live tool-row updates from `notifications/progress`)
 
           ### Asset
 
@@ -137,7 +142,7 @@ jobs:
           Or manually:
 
           \`\`\`bash
-          curl -fsSL -o /tmp/grok.tgz \
+          curl -fsSL -o /tmp/grok.tgz \\
             "https://github.com/jonasvanderhaegen/grok-build/releases/download/${TAG}/grok-macos-aarch64.tar.gz"
           mkdir -p ~/.grok/downloads ~/.grok/bin
           tar -xzf /tmp/grok.tgz -C /tmp
@@ -147,7 +152,8 @@ jobs:
           ~/.grok/bin/grok --version
           \`\`\`
 
-          Start a **new** grok session after install so plugin PreToolUse hooks load at cold start.
+          Start a **new** grok session after install so plugin hooks and MCP progress wiring load at cold start.
+          EOF
           EOF
 
           assets=(

@@ -1913,6 +1913,16 @@ fn tool_call_to_block(tc: &acp::ToolCall, session_cwd: Option<&Path>) -> RenderB
         _ if extract_raw_field(tc, "variant").as_deref() == Some("UseTool") => {
             let tool_name = extract_raw_field(tc, "tool_name").unwrap_or_else(|| tc.title.clone());
             let mut block = UseToolCallBlock::new(tool_name);
+            // Live MCP progress: shell sets title to "{tool}: {progress text}"
+            // while status is InProgress. Strip the tool prefix when present.
+            if matches!(tc.status, acp::ToolCallStatus::InProgress)
+                && !tc.title.is_empty()
+            {
+                let progress = progress_text_from_tool_title(&tc.title, &block.tool_name);
+                if !progress.is_empty() {
+                    block = block.with_progress(progress);
+                }
+            }
             block.input_args = extract_use_tool_args(tc);
             let text = content_text(tc);
             if !text.is_empty() {
@@ -2040,6 +2050,18 @@ fn tool_call_title(tc: &acp::ToolCall) -> Cow<'_, str> {
         Cow::Borrowed(&tc.title)
     }
 }
+
+/// Extract progress display text from a shell progress title of the form
+/// `"{tool_name}: {progress}"` (or return the full title if no prefix match).
+fn progress_text_from_tool_title(title: &str, tool_name: &str) -> String {
+    let prefix = format!("{tool_name}: ");
+    title
+        .strip_prefix(&prefix)
+        .unwrap_or(title)
+        .trim()
+        .to_owned()
+}
+
 /// Build the media block from the typed `raw_output` path.
 fn media_gen_block(tc: &acp::ToolCall, success: bool) -> RenderBlock {
     let mut block = OtherToolCallBlock::new(tool_call_title(tc), String::new());
@@ -6532,6 +6554,48 @@ mod tests {
             panic!("expected UseTool block, got {block:?}");
         };
         assert_eq!(ut.tool_name, "grafana__search");
+    }
+
+    #[test]
+    fn use_tool_in_progress_title_sets_progress_on_block() {
+        let tc = acp::ToolCall::new(
+            acp::ToolCallId::new(Arc::from("mcp-progress")),
+            "skyline__skyline_run_wait: waiting on job 7 · 5s",
+        )
+        .kind(acp::ToolKind::Other)
+        .status(acp::ToolCallStatus::InProgress)
+        .content(vec![])
+        .raw_input(Some(serde_json::json!({
+            "variant": "UseTool",
+            "tool_name": "skyline__skyline_run_wait",
+            "tool_input": { "job_id": 7 }
+        })))
+        .locations(vec![]);
+        let block = tool_call_to_block(&tc, None);
+        let RenderBlock::ToolCall(ToolCallBlock::UseTool(ut)) = block else {
+            panic!("expected UseTool block, got {block:?}");
+        };
+        assert_eq!(ut.tool_name, "skyline__skyline_run_wait");
+        assert_eq!(
+            ut.progress.as_deref(),
+            Some("waiting on job 7 · 5s"),
+            "InProgress title must surface as progress text"
+        );
+    }
+
+    #[test]
+    fn progress_text_from_tool_title_strips_prefix() {
+        assert_eq!(
+            progress_text_from_tool_title(
+                "skyline__skyline_run_wait: waiting on job 7 · 5s",
+                "skyline__skyline_run_wait",
+            ),
+            "waiting on job 7 · 5s"
+        );
+        assert_eq!(
+            progress_text_from_tool_title("bare progress line", "other_tool"),
+            "bare progress line"
+        );
     }
     #[test]
     fn call_mcp_tool_no_raw_input_does_not_panic() {

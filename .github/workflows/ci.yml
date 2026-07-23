@@ -1,0 +1,73 @@
+name: CI
+
+# Targeted tests for the MCP progress / Progressive use_tool path.
+# Runs on GitHub-hosted Ubuntu (faster + cheaper than local macOS cargo).
+#
+# Trigger: push/PR to main, or workflow_dispatch.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  # RUSTFLAGS left default — pre-existing dead_code warnings in tree
+
+jobs:
+  mcp-progress-tests:
+    name: MCP progress unit tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install protoc
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq protobuf-compiler
+          protoc --version
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.92.0"
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ci-ubuntu-mcp-progress
+          cache-targets: true
+
+      # Scoped tests only — full workspace is too large for this fork CI.
+      - name: Test use_tool Progress forwarding
+        run: |
+          set -euo pipefail
+          cargo test -p xai-grok-tools execute_forwards_progress_before_terminal -- --nocapture
+
+      - name: Test MCP progress display helpers
+        run: |
+          set -euo pipefail
+          cargo test -p xai-grok-mcp tool_call_progress -- --nocapture
+
+      - name: Test pager UseTool progress UI
+        run: |
+          set -euo pipefail
+          cargo test -p xai-grok-pager progress -- --nocapture
+
+      - name: Check shell + tools + pager + mcp
+        run: |
+          set -euo pipefail
+          cargo check -p xai-grok-tools -p xai-grok-shell -p xai-grok-pager -p xai-grok-mcp

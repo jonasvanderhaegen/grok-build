@@ -19,6 +19,8 @@ const TRUNCATED_INLINE_LINES: usize = 3;
 pub struct UseToolCallBlock {
     /// The qualified tool name (e.g. "linear__save_issue").
     pub tool_name: String,
+    /// Live progress line from MCP `notifications/progress` while InProgress.
+    pub progress: Option<String>,
     /// Input arguments as key-value pairs (extracted from tool_input JSON).
     pub input_args: Vec<(String, String)>,
     /// Output text from the dispatched tool.
@@ -35,12 +37,19 @@ impl UseToolCallBlock {
     pub fn new(tool_name: impl Into<String>) -> Self {
         Self {
             tool_name: tool_name.into(),
+            progress: None,
             input_args: Vec::new(),
             output: None,
             error: None,
             started_at: None,
             elapsed_ms: None,
         }
+    }
+
+    /// Set live progress text shown on the in-progress tool row.
+    pub fn with_progress(mut self, progress: impl Into<String>) -> Self {
+        self.progress = Some(progress.into());
+        self
     }
 
     pub fn with_error(mut self, error: impl Into<String>) -> Self {
@@ -99,7 +108,7 @@ impl UseToolCallBlock {
         }
     }
 
-    /// Render the header line: **Server** `Action`
+    /// Render the header line: **Server** `Action` [· progress]
     fn header_line(&self, theme: &Theme, muted: bool, max_width: Option<usize>) -> Line<'static> {
         let text_style = if muted {
             theme.muted()
@@ -112,32 +121,47 @@ impl UseToolCallBlock {
         } else {
             theme.fg(theme.command)
         };
+        let progress_style = theme.muted();
 
         let (server, action) = self.split_name();
+        let progress_suffix = self.progress.as_ref().map(|p| format!(" · {p}"));
 
         if server.is_empty() {
+            let mut display = action;
+            if let Some(ref prog) = progress_suffix {
+                display.push_str(prog);
+            }
             let display = match max_width {
-                Some(w) => truncate_str(&action, w),
-                None => action,
+                Some(w) => truncate_str(&display, w),
+                None => display,
             };
             return Line::from(vec![Span::styled(display, bold_style)]);
         }
 
         let prefix = format!("{server} ");
-
         match max_width {
             Some(w) => {
                 let budget = w.saturating_sub(prefix.len());
-                let display_action = truncate_str(&action, budget);
+                let mut action_part = action;
+                if let Some(ref prog) = progress_suffix {
+                    action_part.push_str(prog);
+                }
+                let display_action = truncate_str(&action_part, budget);
                 Line::from(vec![
                     Span::styled(prefix, bold_style),
                     Span::styled(display_action, action_style),
                 ])
             }
-            None => Line::from(vec![
-                Span::styled(prefix, bold_style),
-                Span::styled(action, action_style),
-            ]),
+            None => {
+                let mut spans = vec![
+                    Span::styled(prefix, bold_style),
+                    Span::styled(action, action_style),
+                ];
+                if let Some(ref prog) = progress_suffix {
+                    spans.push(Span::styled(prog.clone(), progress_style));
+                }
+                Line::from(spans)
+            }
         }
     }
 }
@@ -341,5 +365,20 @@ mod tests {
         assert!(expanded.contains("l10"), "expanded:\n{expanded}");
         assert!(!expanded.contains("l11"), "expanded:\n{expanded}");
         assert!(expanded.contains("(2 more lines"), "expanded:\n{expanded}");
+    }
+
+    #[test]
+    fn header_includes_live_progress_text() {
+        let block = UseToolCallBlock::new("skyline__skyline_run_wait")
+            .with_progress("waiting on job 42 · 5s");
+        let collapsed = rendered_text(&block, DisplayMode::Collapsed);
+        assert!(
+            collapsed.contains("waiting on job 42 · 5s"),
+            "collapsed header must show progress, got: {collapsed:?}"
+        );
+        assert!(
+            collapsed.contains("Skyline") || collapsed.contains("Run"),
+            "collapsed header must still show tool name, got: {collapsed:?}"
+        );
     }
 }

@@ -330,6 +330,10 @@ impl ToolCallBlock {
             }
             (ToolCallBlock::UseTool(new), ToolCallBlock::UseTool(old)) => {
                 new.started_at = old.started_at;
+                // Keep prior progress if the update did not carry a new line.
+                if new.progress.is_none() {
+                    new.progress = old.progress.clone();
+                }
             }
             (ToolCallBlock::Skill(new), ToolCallBlock::Skill(old)) => {
                 new.started_at = old.started_at;
