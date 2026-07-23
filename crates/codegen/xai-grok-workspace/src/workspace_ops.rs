@@ -1461,6 +1461,20 @@ impl WorkspaceOps {
         call_id: &str,
         session_id: Option<&str>,
     ) -> Result<ToolRunResult, xai_tool_runtime::ToolError> {
+        self.call_tool_with_progress(name, args, call_id, session_id, None)
+            .await
+    }
+
+    /// Like [`Self::call_tool`], forwarding streamed [`ToolProgress`] frames
+    /// (including MCP `notifications/progress`) to `on_progress` when set.
+    pub async fn call_tool_with_progress(
+        &self,
+        name: &str,
+        args: Value,
+        call_id: &str,
+        session_id: Option<&str>,
+        mut on_progress: Option<&mut (dyn FnMut(xai_tool_runtime::ToolProgress) + Send)>,
+    ) -> Result<ToolRunResult, xai_tool_runtime::ToolError> {
         match self {
             Self::Local { handle } => {
                 let session_id = session_id.ok_or_else(|| {
@@ -1478,7 +1492,26 @@ impl WorkspaceOps {
                         ),
                     )
                 })?;
-                session.toolset().call(name, args, call_id, None).await
+                use futures::StreamExt;
+                let mut stream = session
+                    .toolset()
+                    .call_streaming(name, args, call_id, None);
+                while let Some(item) = stream.next().await {
+                    match item {
+                        xai_tool_runtime::ToolStreamItem::Progress(p) => {
+                            if let Some(cb) = on_progress.as_mut() {
+                                cb(p);
+                            }
+                        }
+                        xai_tool_runtime::ToolStreamItem::Terminal(result) => {
+                            return result;
+                        }
+                    }
+                }
+                Err(xai_tool_runtime::ToolError::custom(
+                    "stream_no_terminal",
+                    format!("tool stream for '{name}' ended without a terminal result"),
+                ))
             }
             Self::Proxy { client } => {
                 if !client.is_connected() {

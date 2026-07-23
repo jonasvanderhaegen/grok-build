@@ -50,6 +50,8 @@ sse-stream = "0.2"
 agent-client-protocol = { workspace = true }
 xai-file-utils = { path = "../xai-file-utils" }
 futures = { workspace = true }
+async-stream = { workspace = true }
+tokio-stream = { workspace = true }
 regex = { workspace = true }
 which = { workspace = true }
 # Atomic descriptor writes (NamedTempFile + persist) in materialize_descriptors.

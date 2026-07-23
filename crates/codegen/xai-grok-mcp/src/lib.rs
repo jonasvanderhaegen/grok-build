@@ -35,4 +35,5 @@ pub mod mcp_http_client;
 pub mod oauth;
 pub mod oauth_config;
 pub mod servers;
+pub mod tool_call_progress;
 pub mod wire;

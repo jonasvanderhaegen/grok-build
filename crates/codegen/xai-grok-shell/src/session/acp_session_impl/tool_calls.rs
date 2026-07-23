@@ -406,6 +406,9 @@ impl SessionActor {
         let workspace_ops = self.workspace_ops.clone();
         let pending_interjections = self.pending_interjections.clone();
         let session_id: Arc<str> = Arc::from(&*self.session_info.id.0);
+        let acp_session_id = self.session_info.id.clone();
+        let gateway = self.notifications.gateway.clone();
+        let gateway_enabled = self.notifications.gateway_enabled.clone();
         let dispatch_futures: Vec<_> = approved
             .iter()
             .enumerate()
@@ -415,6 +418,9 @@ impl SessionActor {
                 let shared_recovery = Arc::clone(&shared_recovery);
                 let workspace_ops = workspace_ops.clone();
                 let session_id = session_id.clone();
+                let acp_session_id = acp_session_id.clone();
+                let gateway = gateway.clone();
+                let gateway_enabled = gateway_enabled.clone();
                 let pending_interjections = pending_interjections.clone();
                 let blocking_wait_depth = self.tool_context.blocking_wait_depth.clone();
                 let interruptible =
@@ -427,6 +433,9 @@ impl SessionActor {
                         let prepared = Arc::clone(&prepared);
                         let workspace_ops = workspace_ops.clone();
                         let session_id = session_id.clone();
+                        let acp_session_id = acp_session_id.clone();
+                        let gateway = gateway.clone();
+                        let gateway_enabled = gateway_enabled.clone();
                         let lock = lock.clone();
                         async move {
                             let _guard = if let Some(ref l) = lock {
@@ -434,7 +443,48 @@ impl SessionActor {
                             } else {
                                 None
                             };
-                            dispatch_tool(&workspace_ops, &prepared, &session_id).await
+                            let mut last_progress_title: Option<String> = None;
+                            let tool_call_id = prepared.tool_call_id.clone();
+                            let tool_name = prepared.tool_name.clone();
+                            let mut on_progress = |p: xai_tool_runtime::ToolProgress| {
+                                let Some(text) =
+                                    xai_grok_mcp::tool_call_progress::tool_progress_display_text(&p)
+                                else {
+                                    return;
+                                };
+                                if text.trim().is_empty() {
+                                    return;
+                                }
+                                let title = format!("{tool_name}: {text}");
+                                if last_progress_title.as_ref() == Some(&title) {
+                                    return;
+                                }
+                                last_progress_title = Some(title.clone());
+                                if !gateway_enabled
+                                    .load(std::sync::atomic::Ordering::Relaxed)
+                                {
+                                    return;
+                                }
+                                let update = acp::SessionUpdate::ToolCallUpdate(
+                                    acp::ToolCallUpdate::new(
+                                        tool_call_id.clone(),
+                                        acp::ToolCallUpdateFields::new()
+                                            .status(Some(acp::ToolCallStatus::InProgress))
+                                            .title(Some(title)),
+                                    ),
+                                );
+                                gateway.forward_fire_and_forget(acp::SessionNotification::new(
+                                    acp_session_id.clone(),
+                                    update,
+                                ));
+                            };
+                            dispatch_tool(
+                                &workspace_ops,
+                                &prepared,
+                                &session_id,
+                                Some(&mut on_progress),
+                            )
+                            .await
                         }
                     };
                     let result = if interruptible {
@@ -518,8 +568,48 @@ impl SessionActor {
                     }
                 };
                 if auth_rejected && self.reactive_managed_reauth(&server).await.is_ok() {
-                    result = dispatch_tool(&self.workspace_ops, &prepared, &self.session_info.id.0)
-                        .await;
+                    let mut last_progress_title: Option<String> = None;
+                    let tool_call_id = prepared.tool_call_id.clone();
+                    let tool_name = prepared.tool_name.clone();
+                    let gateway = self.notifications.gateway.clone();
+                    let gateway_enabled = self.notifications.gateway_enabled.clone();
+                    let acp_session_id = self.session_info.id.clone();
+                    let mut on_progress = |p: xai_tool_runtime::ToolProgress| {
+                        let Some(text) =
+                            xai_grok_mcp::tool_call_progress::tool_progress_display_text(&p)
+                        else {
+                            return;
+                        };
+                        if text.trim().is_empty() {
+                            return;
+                        }
+                        let title = format!("{tool_name}: {text}");
+                        if last_progress_title.as_ref() == Some(&title) {
+                            return;
+                        }
+                        last_progress_title = Some(title.clone());
+                        if !gateway_enabled.load(std::sync::atomic::Ordering::Relaxed) {
+                            return;
+                        }
+                        let update =
+                            acp::SessionUpdate::ToolCallUpdate(acp::ToolCallUpdate::new(
+                                tool_call_id.clone(),
+                                acp::ToolCallUpdateFields::new()
+                                    .status(Some(acp::ToolCallStatus::InProgress))
+                                    .title(Some(title)),
+                            ));
+                        gateway.forward_fire_and_forget(acp::SessionNotification::new(
+                            acp_session_id.clone(),
+                            update,
+                        ));
+                    };
+                    result = dispatch_tool(
+                        &self.workspace_ops,
+                        &prepared,
+                        &self.session_info.id.0,
+                        Some(&mut on_progress),
+                    )
+                    .await;
                 }
             }
             let tool_result_size_bytes = match &result {

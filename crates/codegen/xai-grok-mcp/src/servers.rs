@@ -16,9 +16,10 @@ use tokio::{
 
 use rmcp::{
     ClientHandler, ServiceExt,
+    handler::client::progress::ProgressDispatcher,
     model::{
         CallToolRequestParams, ClientCapabilities, ClientInfo, Implementation,
-        PaginatedRequestParams,
+        PaginatedRequestParams, ProgressNotificationParam,
     },
     service::{
         ClientInitializeError, NotificationContext, RoleClient, RunningService, ServiceError,
@@ -1357,10 +1358,57 @@ impl xai_tool_runtime::Tool for McpErasedTool {
         xai_tool_types::ToolDescription::new(&self.tool.name, &self.tool.description)
     }
 
+    fn execute(
+        &self,
+        ctx: xai_tool_runtime::ToolCallContext,
+        raw: serde_json::Value,
+    ) -> impl std::future::Future<Output = xai_tool_runtime::ToolStream<ToolOutput>> + Send {
+        let tool = self.tool.clone();
+        async move {
+            Box::pin(async_stream::stream! {
+                let erased = McpErasedTool { tool };
+                let (progress_tx, mut progress_rx) = tokio::sync::mpsc::unbounded_channel();
+                let mut terminal_fut = std::pin::pin!(erased.run_with_optional_progress(
+                    ctx,
+                    raw,
+                    Some(progress_tx),
+                ));
+                loop {
+                    tokio::select! {
+                        biased;
+                        maybe = progress_rx.recv() => {
+                            if let Some(p) = maybe {
+                                yield xai_tool_runtime::ToolStreamItem::Progress(p);
+                            }
+                        }
+                        result = &mut terminal_fut => {
+                            while let Ok(p) = progress_rx.try_recv() {
+                                yield xai_tool_runtime::ToolStreamItem::Progress(p);
+                            }
+                            yield xai_tool_runtime::ToolStreamItem::Terminal(result);
+                            break;
+                        }
+                    }
+                }
+            }) as xai_tool_runtime::ToolStream<ToolOutput>
+        }
+    }
+
     async fn run(
+        &self,
+        ctx: xai_tool_runtime::ToolCallContext,
+        raw: serde_json::Value,
+    ) -> Result<ToolOutput, xai_tool_runtime::ToolError> {
+        self.run_with_optional_progress(ctx, raw, None).await
+    }
+}
+
+impl McpErasedTool {
+    async fn run_with_optional_progress(
         &self,
         _ctx: xai_tool_runtime::ToolCallContext,
         raw: serde_json::Value,
+        progress_tx: Option<tokio::sync::mpsc::UnboundedSender<xai_tool_runtime::ToolProgress>>,
     ) -> Result<ToolOutput, xai_tool_runtime::ToolError> {
         let mcp_call_start = std::time::Instant::now();
         let (client, event_writer) = {
@@ -1390,7 +1438,14 @@ impl xai_tool_runtime::Tool for McpErasedTool {
         let mut is_timeout = false;
         let ew = &event_writer;
         let dispatch_result = match self
-            .try_call_tool(&client, &raw, &mut reconnect_attempted, &mut is_timeout, ew)
+            .try_call_tool_with_progress(
+                &client,
+                &raw,
+                &mut reconnect_attempted,
+                &mut is_timeout,
+                ew,
+                progress_tx.clone(),
+            )
             .await
         {
             Ok(result) => Ok(result),
@@ -1403,7 +1458,14 @@ impl xai_tool_runtime::Tool for McpErasedTool {
                     success: reauth_ok,
                 });
                 if reauth_ok {
-                    self.try_call_tool(&client, &raw, &mut reconnect_attempted, &mut is_timeout, ew)
+                    self.try_call_tool_with_progress(
+                        &client,
+                        &raw,
+                        &mut reconnect_attempted,
+                        &mut is_timeout,
+                        ew,
+                        progress_tx,
+                    )
                         .await
                         .map_err(|e| {
                             xai_tool_runtime::ToolError::custom("process_manager", e.to_string())
@@ -1583,6 +1645,26 @@ impl McpErasedTool {
         is_timeout: &mut bool,
         ew: &xai_file_utils::events::EventWriter,
     ) -> Result<rmcp::model::CallToolResult, xai_tool_runtime::ToolError> {
+        self.try_call_tool_with_progress(
+            client,
+            raw,
+            reconnect_attempted,
+            is_timeout,
+            ew,
+            None,
+        )
+        .await
+    }
+
+    async fn try_call_tool_with_progress(
+        &self,
+        client: &Arc<McpClient>,
+        raw: &serde_json::Value,
+        reconnect_attempted: &mut bool,
+        is_timeout: &mut bool,
+        ew: &xai_file_utils::events::EventWriter,
+        progress_tx: Option<tokio::sync::mpsc::UnboundedSender<xai_tool_runtime::ToolProgress>>,
+    ) -> Result<rmcp::model::CallToolResult, xai_tool_runtime::ToolError> {
         let mcp_service = client
             .ensure_initialized()
             .await
@@ -1592,12 +1674,20 @@ impl McpErasedTool {
         let mut params = CallToolRequestParams::new(self.tool.name.clone());
         params.arguments = raw.as_object().cloned();
 
-        let result =
-            tokio::time::timeout(timeout_duration, mcp_service.call_tool(params.clone())).await;
+        // Subscribe to notifications/progress for this tools/call (token is
+        // stamped by rmcp on the request). Without this, servers that emit
+        // progress (skybox wait_for_job, skyline run_wait) appear idle.
+        let result = crate::tool_call_progress::call_tool_with_progress_timeout(
+            mcp_service.as_ref(),
+            params.clone(),
+            timeout_duration,
+            progress_tx.clone(),
+        )
+        .await;
 
         match result {
-            Ok(Ok(call_result)) => Ok(call_result),
-            Ok(Err(service_err))
+            Ok(call_result) => Ok(call_result),
+            Err(service_err)
                 if should_recover_service_error(
                     &service_err,
                     client.is_http(),
@@ -1613,16 +1703,12 @@ impl McpErasedTool {
                     reconnect_attempted,
                     is_timeout,
                     ew,
+                    progress_tx,
                 )
                 .await
             }
-            Ok(Err(e)) => Err(xai_tool_runtime::ToolError::custom(
-                "process_manager",
-                e.to_string(),
-            )),
-            Err(_) => {
+            Err(ServiceError::Timeout { .. }) => {
                 *is_timeout = true;
-                // Reset for the next call but don't retry — a slow side-effecting tool must not run twice.
                 if client.is_http() && !*reconnect_attempted {
                     client.reset_transport().await;
                     *reconnect_attempted = true;
@@ -1635,6 +1721,10 @@ impl McpErasedTool {
                     ),
                 ))
             }
+            Err(e) => Err(xai_tool_runtime::ToolError::custom(
+                "process_manager",
+                e.to_string(),
+            )),
         }
     }
 
@@ -1651,6 +1741,7 @@ impl McpErasedTool {
         reconnect_attempted: &mut bool,
         is_timeout: &mut bool,
         ew: &xai_file_utils::events::EventWriter,
+        progress_tx: Option<tokio::sync::mpsc::UnboundedSender<xai_tool_runtime::ToolProgress>>,
     ) -> Result<rmcp::model::CallToolResult, xai_tool_runtime::ToolError> {
         *reconnect_attempted = true;
         tracing::warn!(
@@ -1685,13 +1776,16 @@ impl McpErasedTool {
                 ));
             }
         };
-        match tokio::time::timeout(timeout_duration, mcp_service.call_tool(params)).await {
-            Ok(Ok(call_result)) => Ok(call_result),
-            Ok(Err(retry_err)) => Err(xai_tool_runtime::ToolError::custom(
-                "process_manager",
-                retry_err.to_string(),
-            )),
-            Err(_) => {
+        match crate::tool_call_progress::call_tool_with_progress_timeout(
+            mcp_service.as_ref(),
+            params,
+            timeout_duration,
+            progress_tx,
+        )
+        .await
+        {
+            Ok(call_result) => Ok(call_result),
+            Err(ServiceError::Timeout { .. }) => {
                 *is_timeout = true;
                 Err(xai_tool_runtime::ToolError::custom(
                     "process_manager",
@@ -1701,6 +1795,10 @@ impl McpErasedTool {
                     ),
                 ))
             }
+            Err(retry_err) => Err(xai_tool_runtime::ToolError::custom(
+                "process_manager",
+                retry_err.to_string(),
+            )),
         }
     }
 }
@@ -2546,6 +2644,9 @@ pub struct McpClient {
     /// `.await`, and the handler's `emit` path is short and
     /// allocation-free.
     notify_tx: SharedEventTx,
+    /// Shared with [`GrokClientHandler`]: receives `notifications/progress` and
+    /// fans them to per-token subscribers during `tools/call`.
+    progress: std::sync::Arc<ProgressDispatcher>,
     /// RAII handle for the per-client transport-liveness poller.
     ///
     /// `Some` after [`Self::arm_liveness_watcher`] succeeds; `None`
@@ -2681,6 +2782,7 @@ impl McpClient {
             warn_budget: crate::mcp_http_client::WarnBudget::default(),
             reconnect,
             notify_tx: Arc::new(parking_lot::Mutex::new(None)),
+            progress: Arc::new(ProgressDispatcher::new()),
             liveness_handle: Arc::new(parking_lot::Mutex::new(None)),
         }
     }
@@ -3484,6 +3586,7 @@ impl McpClient {
             info: Self::make_client_info(&self.server_name),
             server_name: self.server_name.clone(),
             notify_tx: Arc::clone(&self.notify_tx),
+            progress: Arc::clone(&self.progress),
         }
     }
 
@@ -4351,6 +4454,10 @@ pub struct GrokClientHandler {
     /// post-handshake is supported without restarting the rmcp
     /// service loop.
     notify_tx: SharedEventTx,
+    /// Shared with the owning [`McpClient`]. `on_progress` forwards
+    /// server progress notifications here so active `tools/call`
+    /// subscribers receive them.
+    progress: Arc<ProgressDispatcher>,
 }
 
 impl GrokClientHandler {
@@ -4365,6 +4472,11 @@ impl GrokClientHandler {
         if let Some(tx) = sender {
             let _ = tx.send(ev);
         }
+    }
+
+    /// Progress dispatcher shared with the owning [`McpClient`].
+    pub fn progress_dispatcher(&self) -> &ProgressDispatcher {
+        &self.progress
     }
 }
 
@@ -4386,6 +4498,14 @@ impl ClientHandler for GrokClientHandler {
         self.emit(McpClientEvent::ResourcesChanged {
             server: self.server_name.clone(),
         });
+    }
+
+    async fn on_progress(
+        &self,
+        params: ProgressNotificationParam,
+        _context: NotificationContext<RoleClient>,
+    ) {
+        self.progress.handle_notification(params).await;
     }
 
     fn get_info(&self) -> ClientInfo {
@@ -6006,6 +6126,7 @@ mod tests {
                 &mut reconnect_attempted,
                 &mut is_timeout,
                 &ew,
+                None,
             )
             .await
             .expect_err("recover must fail against an unreachable host");
@@ -6749,7 +6870,8 @@ mod tests {
             let handler = GrokClientHandler {
                 info: McpClient::make_client_info("dead"),
                 server_name: "dead".to_string(),
-                notify_tx: Arc::new(parking_lot::Mutex::new(None)),
+                progress: Arc::new(ProgressDispatcher::new()),
+            notify_tx: Arc::new(parking_lot::Mutex::new(None)),
             };
             let transport = rmcp::transport::async_rw::AsyncRwTransport::<RoleClient, _, _>::new(
                 client_read,
@@ -7487,6 +7609,7 @@ mod tests {
         let handler = GrokClientHandler {
             info: McpClient::make_client_info("test"),
             server_name: "test".to_string(),
+            progress: Arc::new(ProgressDispatcher::new()),
             notify_tx: Arc::new(parking_lot::Mutex::new(Some(tx))),
         };
         handler.emit(McpClientEvent::ToolsChanged {
@@ -7507,6 +7630,7 @@ mod tests {
         let handler = GrokClientHandler {
             info: McpClient::make_client_info("test"),
             server_name: "test".to_string(),
+            progress: Arc::new(ProgressDispatcher::new()),
             notify_tx: Arc::new(parking_lot::Mutex::new(None)),
         };
         handler.emit(McpClientEvent::ToolsChanged {
@@ -7522,6 +7646,7 @@ mod tests {
         let handler = GrokClientHandler {
             info: info.clone(),
             server_name: "test-srv".to_string(),
+            progress: Arc::new(ProgressDispatcher::new()),
             notify_tx: Arc::new(parking_lot::Mutex::new(None)),
         };
         let got = handler.get_info();

@@ -8,13 +8,16 @@ use super::*;
 const BASH_MODE_FINAL_OUTPUT_LINES: usize = 10;
 const BASH_MODE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60 * 60);
 
-/// Phase 2: dispatch a tool call through [`WorkspaceOps::call_tool`].
+/// Phase 2: dispatch a tool call through [`WorkspaceOps::call_tool_with_progress`].
 ///
 /// Agent sessions always use local workspace ops (in-process toolset).
+/// When `on_progress` is set, streamed frames (including MCP
+/// `notifications/progress`) are forwarded so the UI can update live status.
 pub(super) async fn dispatch_tool(
     workspace_ops: &xai_grok_workspace::WorkspaceOps,
     prepared: &PreparedToolCall,
     session_id: &str,
+    on_progress: Option<&mut (dyn FnMut(xai_tool_runtime::ToolProgress) + Send)>,
 ) -> Result<ToolRunResult, xai_tool_runtime::ToolError> {
     tracing::debug!(
         tool = %prepared.tool_name,
@@ -24,11 +27,12 @@ pub(super) async fn dispatch_tool(
         "dispatch_tool"
     );
     workspace_ops
-        .call_tool(
+        .call_tool_with_progress(
             &prepared.tool_name,
             prepared.parsed_args.clone(),
             &prepared.tool_call_id.0,
             Some(session_id),
+            on_progress,
         )
         .await
 }
