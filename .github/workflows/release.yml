@@ -62,11 +62,19 @@ jobs:
         with:
           ref: ${{ github.ref_type == 'tag' && github.ref_name || github.sha }}
 
+      - name: Install build deps (protoc)
+        shell: bash
+        run: |
+          set -euo pipefail
+          # bin/protoc is a dotslash wrapper; CI runners lack both protoc and
+          # dotslash. Homebrew protoc on PATH is enough for xai-proto-build.
+          brew list protobuf &>/dev/null || brew install protobuf
+          protoc --version
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@master
         with:
           toolchain: '1.92.0'
-
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
         with:
