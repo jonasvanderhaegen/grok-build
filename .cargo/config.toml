@@ -62,11 +62,19 @@ rustflags = [
 rustflags = [
     "-C", "force-unwind-tables=yes",
     "-C", "target-feature=+crt-static",
+    # Legacy symbol mangling produces enormous names for the generic-heavy
+    # deps we link (windows-rs, syntect, ratatui, etc.), overflowing PDB
+    # limits — `LINK : fatal error LNK4319: A PDB limit was hit while
+    # adding public symbols.` v0 mangling compresses repeated substrings
+    # and keeps names well under the PDB's per-symbol length limit; it's
+    # stable since well before our pinned toolchain (1.97 makes it the
+    # default, but we set it explicitly since we're still pre-1.97).
+    "-C", "symbol-mangling-version=v0",
     # Large binaries with many generic instantiations overflow the default
-    # 4KB PDB page size, causing `LINK : fatal error LNK4319: A PDB limit
-    # was hit while adding public symbols.` 8192 was not enough for this
-    # binary; 32768 is the maximum value link.exe accepts (LNK1399 rejects
-    # 65536 — valid values are 4096/8192/16384/32768).
+    # 4KB PDB page size, causing the same LNK4319 error. 8192 was not
+    # enough for this binary; 32768 is the maximum value link.exe accepts
+    # (LNK1399 rejects 65536 — valid values are 4096/8192/16384/32768).
+    # Kept alongside v0 mangling for extra margin.
     "-C", "link-args=/PDBPAGESIZE:32768",
 ]
 
@@ -74,6 +82,7 @@ rustflags = [
 rustflags = [
     "-C", "force-unwind-tables=yes",
     "-C", "target-feature=+crt-static",
+    "-C", "symbol-mangling-version=v0",
     "-C", "link-args=/PDBPAGESIZE:32768",
 ]
 
