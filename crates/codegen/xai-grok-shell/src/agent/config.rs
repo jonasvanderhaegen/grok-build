@@ -762,7 +762,13 @@ fn remote_compat_value(
     }
 }
 /// Resolve vendor compatibility cells from TOML and remote settings.
-fn resolve_compat_config(
+///
+/// `pub` (not `pub(crate)`) so clients that only hold on-disk config —
+/// the pager's own session-creation paths, which run as a separate
+/// process from the live `Agent` and never see its `Config::compat_resolved` —
+/// can resolve the same env > config.toml > remote > `FORK_DEFAULTS` chain
+/// instead of falling back to the all-on `CompatConfig::default()`.
+pub fn resolve_compat_config(
     config: &CompatConfigToml,
     remote: Option<&crate::util::config::RemoteSettings>,
 ) -> CompatConfig {

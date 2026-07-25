@@ -168,6 +168,38 @@ pub(crate) fn parse_session_load_running_prompt_id(
         .and_then(|v| v.as_str())
         .map(String::from)
 }
+/// Resolve the live vendor-compat matrix for session-creation paths that
+/// only have on-disk config in scope — no live `Agent::cfg` (the agent runs
+/// as a separate spawned process) and no remote settings threaded this far.
+/// Falls back to `FORK_DEFAULTS` (claude off) rather than the all-on
+/// default matrix if config can't be loaded, so a load failure fails
+/// closed instead of silently re-inheriting Claude MCP servers.
+pub(crate) fn resolve_pager_compat_config() -> xai_grok_tools::types::compat::CompatConfig {
+    xai_grok_shell::config::load_effective_config()
+        .ok()
+        .map(|raw| resolve_pager_compat_config_from_raw(&raw))
+        .unwrap_or(xai_grok_tools::types::compat::CompatConfig::FORK_DEFAULTS)
+}
+/// Pure half of [`resolve_pager_compat_config`]: same resolution, but takes
+/// an already-parsed config so tests can assert the matrix without touching
+/// the real on-disk config file.
+///
+/// Extracts just the `[compat]` table (same shape as
+/// `agent::config::resolve_compat_sessions_from_raw`) instead of running the
+/// full `Config::new_from_toml_cfg` deserialization (auth providers, model
+/// overrides, etc.) — an unrelated parse failure elsewhere in the raw config
+/// must not silently mask a user's `[compat.claude]` opt-in back to
+/// `FORK_DEFAULTS`.
+pub(crate) fn resolve_pager_compat_config_from_raw(
+    raw: &toml::Value,
+) -> xai_grok_tools::types::compat::CompatConfig {
+    let compat_toml: xai_grok_tools::types::compat::CompatConfigToml = raw
+        .get("compat")
+        .cloned()
+        .and_then(|v| v.try_into().ok())
+        .unwrap_or_default();
+    xai_grok_shell::agent::config::resolve_compat_config(&compat_toml, None)
+}
 /// Whether `raw` is (or wraps) a disk-full / ENOSPC failure.
 fn is_disk_full_error(raw: &str) -> bool {
     raw.contains(xai_fast_worktree::OUT_OF_DISK_CONTEXT)

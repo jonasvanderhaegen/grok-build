@@ -595,11 +595,11 @@ async fn open_session(
     session_id_flag: Option<&str>,
     restore_code: Option<bool>,
 ) -> anyhow::Result<OpenedSession> {
-    // Pager opens sessions before the agent resolves per-vendor compat;
-    // default (all-on) preserves existing behavior — the agent applies
-    // the resolved config once the session is live.
+    // Resolve compat from on-disk config so claude MCP servers stay
+    // excluded by default here too (FORK_DEFAULTS), matching the live
+    // agent's own resolution instead of the all-on default.
     let mcp_servers =
-        cli_config::load_mcp_servers(cwd, &xai_grok_tools::types::compat::CompatConfig::default());
+        cli_config::load_mcp_servers(cwd, &crate::app::resolve_pager_compat_config());
 
     if let Some(sid) = session_id_flag {
         let try_load: Result<acp::LoadSessionResponse, _> = acp_send(
@@ -644,7 +644,7 @@ async fn open_session_with_id(
     let cwd_str = cwd.to_string_lossy();
     crate::app::session_startup::ensure_session_id_available(session_id, &cwd_str)?;
     let mcp_servers =
-        cli_config::load_mcp_servers(cwd, &xai_grok_tools::types::compat::CompatConfig::default());
+        cli_config::load_mcp_servers(cwd, &crate::app::resolve_pager_compat_config());
     let new_resp: acp::NewSessionResponse = acp_send(
         acp::NewSessionRequest::new(cwd.to_path_buf())
             .mcp_servers(mcp_servers)
