@@ -2316,6 +2316,36 @@ fn worktree_resume_failure_sanitizes_detail_before_hint() {
     let id_msg = worktree_resume_failure_message(None, &sanitize_user_error(raw));
     assert_eq!(id_msg, "couldn't resume worktree session: No space left on device");
 }
+/// The compat matrix that `CreateSession` / `CreateWorktreeSession` /
+/// `LoadSession` / the reconnect path now resolve for an unconfigured
+/// repo must be `FORK_DEFAULTS` (claude off), not the all-on default
+/// matrix these call sites used to hardcode — that gap let every live
+/// grok session keep inheriting `~/.claude.json` MCP servers regardless
+/// of the fork's opt-out.
+#[test]
+fn resolve_pager_compat_config_from_raw_defaults_claude_off() {
+    let raw: toml::Value = toml::from_str("").expect("parse empty config");
+    let resolved = helpers::resolve_pager_compat_config_from_raw(&raw);
+    assert!(
+        !resolved.claude.mcps,
+        "claude MCP servers must be excluded from live sessions by default"
+    );
+    assert!(!resolved.claude.sessions);
+    assert!(resolved.cursor.mcps);
+    assert!(resolved.codex.sessions);
+    assert_ne!(resolved, xai_grok_tools::types::compat::CompatConfig::default());
+    assert_eq!(resolved, xai_grok_tools::types::compat::CompatConfig::FORK_DEFAULTS);
+}
+/// An explicit `[compat.claude]` override in config.toml must still reach
+/// the pager's session-creation paths through the resolved config, the
+/// same as it does for `grok inspect`'s display.
+#[test]
+fn resolve_pager_compat_config_from_raw_respects_config_toml_override() {
+    let raw: toml::Value =
+        toml::from_str("[compat.claude]\nmcps = true\n").expect("parse config");
+    let resolved = helpers::resolve_pager_compat_config_from_raw(&raw);
+    assert!(resolved.claude.mcps, "explicit config.toml opt-in must be honored");
+}
 /// A resume-picker entry converts to a **dormant** dashboard roster row
 /// (the non-leader idle source) preserving title, cwd, model, worktree
 /// flag, origin, and last-change time.

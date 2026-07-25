@@ -854,10 +854,18 @@ fn list_plugins(discovered: &[xai_grok_agent::plugins::DiscoveredPlugin]) -> Vec
 }
 
 /// Wraps the production marketplace resolver (`marketplace::resolve`).
+///
+/// Gated on `claude_plugins_enabled()`, matching `discovery.rs`'s equivalent
+/// call: otherwise this panel would list "N enabled plugins" for
+/// marketplaces that `discover_plugins` never actually scans under
+/// `FORK_DEFAULTS`, contradicting the panel's own field name.
 fn list_marketplaces(git_root: Option<&Path>) -> Vec<MarketplaceEntry> {
     let Some(root) = git_root else {
         return vec![];
     };
+    if !xai_grok_agent::plugins::discovery::claude_plugins_enabled() {
+        return vec![];
+    }
     xai_grok_agent::plugins::marketplace::resolve(root)
         .into_iter()
         .map(|m| MarketplaceEntry {

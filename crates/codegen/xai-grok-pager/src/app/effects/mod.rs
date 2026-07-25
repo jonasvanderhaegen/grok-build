@@ -14,7 +14,7 @@ pub use helpers::ConversationsPartial;
 pub(super) use helpers::parse_session_load_running_prompt_id;
 pub(crate) use helpers::{
     EffectMeta, RestoreProgressMsg, SessionFlags, persist_permission_mode_and_notify,
-    persist_setting, sanitize_user_error,
+    persist_setting, resolve_pager_compat_config, sanitize_user_error,
 };
 use helpers::*;
 use std::path::{Path, PathBuf};
@@ -131,7 +131,7 @@ pub(crate) fn execute(
             chat_kind,
         } => {
             let tx = acp_tx.clone();
-            let compat = xai_grok_tools::types::compat::CompatConfig::default();
+            let compat = resolve_pager_compat_config();
             let mcp_servers = xai_grok_shell::util::config::load_mcp_servers(
                 &session_cwd,
                 &compat,
@@ -476,7 +476,7 @@ pub(crate) fn execute(
                     }
                     let mcp_servers = xai_grok_shell::util::config::load_mcp_servers(
                         &session_cwd,
-                        &xai_grok_tools::types::compat::CompatConfig::default(),
+                        &resolve_pager_compat_config(),
                     );
                     let result = acp_send(
                             acp::NewSessionRequest::new(session_cwd.clone())
@@ -524,7 +524,7 @@ pub(crate) fn execute(
             let mcp_started = std::time::Instant::now();
             let mcp_servers = xai_grok_shell::util::config::load_mcp_servers(
                 &cwd,
-                &xai_grok_tools::types::compat::CompatConfig::default(),
+                &resolve_pager_compat_config(),
             );
             tracing::info!(
                 elapsed_ms = mcp_started.elapsed().as_millis() as u64,
