@@ -20,6 +20,7 @@ use xai_grok_sampling_types::{
 };
 use xai_grok_tools::types::compat::{
     COMPAT_CELLS, CompatConfig, CompatConfigToml, CompatRemoteKey, CompatSurface, CompatVendor,
+    VendorCompat,
 };
 /// The mode in which the agent is running.
 /// Determines behavior like relay sync enablement.
@@ -765,7 +766,8 @@ fn resolve_compat_config(
     config: &CompatConfigToml,
     remote: Option<&crate::util::config::RemoteSettings>,
 ) -> CompatConfig {
-    let defaults = CompatConfig::default();
+    // FORK DELTA: the chain ends on FORK_DEFAULTS (claude off), not all-on.
+    let defaults = CompatConfig::FORK_DEFAULTS;
     let mut resolved = defaults;
     for cell in COMPAT_CELLS {
         resolved.set(
@@ -916,6 +918,11 @@ impl PluginsConfig {
     /// Native `.grok/config.toml` entries already present take precedence:
     /// a name is only added if it isn't already in the opposite list.
     pub fn merge_claude_enabled_plugins(&mut self, _cwd: Option<&std::path::Path>) {
+        // FORK DELTA: `~/.claude/settings.json` does not decide which plugins a
+        // grok session enables unless Claude plugin compat is explicitly on.
+        if !xai_grok_agent::plugins::discovery::claude_plugins_enabled() {
+            return;
+        }
         if crate::claude_import::is_claude_import_marked_with_log("merge_claude_enabled_plugins") {
             return;
         }
@@ -11079,9 +11086,16 @@ agent_type = "cursor"
     fn assert_session_one_disabled(config: CompatConfig, expected: CompatVendor) {
         for cell in COMPAT_CELLS {
             if cell.surface() == CompatSurface::Sessions {
+                // FORK DELTA: claude sessions are off at the baseline, so fold
+                // that in. Independence is still asserted for cursor and codex;
+                // the claude opt-in path is covered by
+                // `claude_surfaces_opt_back_in_over_fork_default`.
+                let want = cell.vendor() != expected
+                    && (cell.vendor() != CompatVendor::Claude
+                        || CompatConfig::FORK_DEFAULTS.claude.sessions);
                 assert_eq!(
                     config.value(cell),
-                    cell.vendor() != expected,
+                    want,
                     "{}.sessions",
                     cell.vendor().as_str()
                 );
@@ -11118,10 +11132,28 @@ agent_type = "cursor"
     #[serial]
     fn resolve_compat_defaults_match_registry() {
         let _env = isolate_compat_env();
-        assert_eq!(
-            resolve_compat_config(&CompatConfigToml::default(), None),
-            CompatConfig::default()
-        );
+        // FORK DELTA: an unconfigured resolve lands on FORK_DEFAULTS, so every
+        // claude surface is off and cursor/codex are untouched.
+        let resolved = resolve_compat_config(&CompatConfigToml::default(), None);
+        assert_eq!(resolved, CompatConfig::FORK_DEFAULTS);
+        assert_eq!(resolved.claude, VendorCompat::ALL_OFF);
+        assert!(resolved.cursor.skills && resolved.codex.sessions);
+    }
+
+    /// FORK DELTA: opting a claude surface back in still works, by TOML or env.
+    #[test]
+    #[serial]
+    fn claude_surfaces_opt_back_in_over_fork_default() {
+        let _env = isolate_compat_env();
+        let toml = parse_compat("[compat.claude]\nskills = true\n");
+        let resolved = resolve_compat_config(&toml, None);
+        assert!(resolved.claude.skills, "TOML must override the fork default");
+        assert!(!resolved.claude.hooks, "untouched cells stay off");
+
+        let _guard = EnvGuard::set("GROK_CLAUDE_HOOKS_ENABLED", "1");
+        let resolved = resolve_compat_config(&CompatConfigToml::default(), None);
+        assert!(resolved.claude.hooks, "env must override the fork default");
+        assert!(!resolved.claude.skills);
     }
     #[test]
     #[serial]
@@ -11308,7 +11340,9 @@ hooks = true
         assert!(!resolved.cursor.sessions);
         assert!(!resolved.codex.hooks);
         assert!(resolved.cursor.hooks);
-        assert!(resolved.claude.hooks);
+        // FORK DELTA: was `assert!(resolved.claude.hooks)` under the all-on
+        // baseline; claude hooks now stay off unless opted in.
+        assert!(!resolved.claude.hooks);
         let _session = EnvGuard::set("GROK_CURSOR_SESSIONS_ENABLED", "true");
         let _hook = EnvGuard::set("GROK_CODEX_HOOKS_ENABLED", "true");
         let resolved = resolve_compat_config(&config, Some(&remote));

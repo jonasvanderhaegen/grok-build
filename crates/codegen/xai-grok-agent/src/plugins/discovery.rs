@@ -206,6 +206,18 @@ impl DiscoveryConfig {
     }
 }
 
+/// FORK DELTA: whether Claude's plugin trees are scanned at all.
+///
+/// Upstream discovers `~/.claude/plugins`, project `.claude/plugins`, and the
+/// three Claude marketplace registries unconditionally. None of them is a
+/// `[compat.claude]` surface, so no config setting could ever turn them off —
+/// disabling every compat cell still left Claude marketplace plugins loading
+/// their hooks into a grok session. This fork defaults them OFF. Set
+/// `GROK_CLAUDE_PLUGINS_ENABLED=1` to restore upstream behaviour.
+pub fn claude_plugins_enabled() -> bool {
+    xai_grok_config::env_bool("GROK_CLAUDE_PLUGINS_ENABLED").unwrap_or(false)
+}
+
 // ── Discovery entry point ─────────────────────────────────────────────
 
 /// User plugin directories in priority order: `$GROK_HOME/plugins` then
@@ -221,7 +233,9 @@ fn user_plugin_dirs(home: Option<&Path>, grok: Option<&Path>) -> Vec<(PathBuf, P
     if let Some(g) = grok {
         dirs.push((g.join("plugins"), PluginOrigin::UserGrok));
     }
-    if let Some(h) = home {
+    if let Some(h) = home
+        && claude_plugins_enabled()
+    {
         dirs.push((h.join(".claude").join("plugins"), PluginOrigin::UserClaude));
     }
     dirs
@@ -261,7 +275,12 @@ pub fn project_plugin_dirs(cwd: Option<&Path>) -> (Vec<PathBuf>, Option<PathBuf>
 /// ([`crate::repo::RepoDirChain`]). The folder-trust gate reuses its one shared
 /// chain here so detection and discovery can never drift.
 pub fn project_plugin_dirs_in(chain_dirs: &[PathBuf]) -> Vec<PathBuf> {
-    crate::repo::existing_subdirs_along(chain_dirs, &[".grok/plugins", ".claude/plugins"])
+    let subdirs: &[&str] = if claude_plugins_enabled() {
+        &[".grok/plugins", ".claude/plugins"]
+    } else {
+        &[".grok/plugins"]
+    };
+    crate::repo::existing_subdirs_along(chain_dirs, subdirs)
 }
 
 /// Discover all plugins from the filesystem.
@@ -318,7 +337,9 @@ pub fn discover_plugins(
 
         // 3b. Marketplace plugins (extraKnownMarketplaces in .claude/settings.json).
         // Reuse the git root resolved above (one walk, no second discover).
-        if let Some(ref root) = git_root {
+        if let Some(ref root) = git_root
+            && claude_plugins_enabled()
+        {
             for marketplace in &super::marketplace::resolve(root) {
                 for dir in &marketplace.plugin_dirs {
                     collect_plugin(
@@ -360,19 +381,21 @@ pub fn discover_plugins(
     // Marketplace repos are cloned locally and registered here.
     // Tracks marketplace installs in installed_plugins.json with explicit
     // Each marketplace has a plugins/ (and optionally external_plugins/) subdirectory.
-    for marketplace in &super::marketplace::resolve_known_marketplaces() {
-        for dir in &marketplace.plugin_dirs {
-            collect_plugin(
-                dir,
-                PluginScope::User,
-                PluginOrigin::ClaudeMarketplace {
-                    marketplace: marketplace.name.clone(),
-                },
-                trust_store,
-                project_trusted,
-                &mut seen_paths,
-                &mut candidates,
-            );
+    if claude_plugins_enabled() {
+        for marketplace in &super::marketplace::resolve_known_marketplaces() {
+            for dir in &marketplace.plugin_dirs {
+                collect_plugin(
+                    dir,
+                    PluginScope::User,
+                    PluginOrigin::ClaudeMarketplace {
+                        marketplace: marketplace.name.clone(),
+                    },
+                    trust_store,
+                    project_trusted,
+                    &mut seen_paths,
+                    &mut candidates,
+                );
+            }
         }
     }
 
@@ -397,7 +420,9 @@ pub fn discover_plugins(
     // scope wins. Within same scope, first-found (alphabetical by canonical
     // with explicit installPath entries (nested under cache/<marketplace>/<plugin>/<version>/).
     // The plugin name is extracted from the JSON key ("name@marketplace").
-    if let Some(home) = dirs::home_dir() {
+    if let Some(home) = dirs::home_dir()
+        && claude_plugins_enabled()
+    {
         let installed_json = home
             .join(".claude")
             .join("plugins")
@@ -908,8 +933,28 @@ mod tests {
         plugin_dir
     }
 
+    /// Set `GROK_CLAUDE_PLUGINS_ENABLED` for the duration of a test.
+    struct ClaudePluginsEnv;
+    impl ClaudePluginsEnv {
+        fn on() -> Self {
+            unsafe { std::env::set_var("GROK_CLAUDE_PLUGINS_ENABLED", "1") };
+            Self
+        }
+        fn off() -> Self {
+            unsafe { std::env::remove_var("GROK_CLAUDE_PLUGINS_ENABLED") };
+            Self
+        }
+    }
+    impl Drop for ClaudePluginsEnv {
+        fn drop(&mut self) {
+            unsafe { std::env::remove_var("GROK_CLAUDE_PLUGINS_ENABLED") };
+        }
+    }
+
     #[test]
+    #[serial_test::serial]
     fn user_plugin_dirs_are_grok_and_claude_only_no_legacy() {
+        let _env = ClaudePluginsEnv::on();
         let home = Path::new("/home/u");
         let grok = Path::new("/custom/grokhome");
         let dirs = user_plugin_dirs(Some(home), Some(grok));
@@ -923,6 +968,41 @@ mod tests {
             !dirs
                 .iter()
                 .any(|(p, _)| p == &home.join(".grok").join("plugins"))
+        );
+    }
+
+    /// FORK DELTA: with nothing opting in, `~/.claude/plugins` is not scanned.
+    #[test]
+    #[serial_test::serial]
+    fn user_plugin_dirs_exclude_claude_by_default() {
+        let _env = ClaudePluginsEnv::off();
+        let home = Path::new("/home/u");
+        let grok = Path::new("/custom/grokhome");
+        let dirs = user_plugin_dirs(Some(home), Some(grok));
+        assert_eq!(dirs, vec![(grok.join("plugins"), PluginOrigin::UserGrok)]);
+    }
+
+    /// FORK DELTA: the project chain drops `.claude/plugins` by default.
+    #[test]
+    #[serial_test::serial]
+    fn project_plugin_dirs_exclude_claude_by_default() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join(".grok/plugins")).unwrap();
+        std::fs::create_dir_all(root.join(".claude/plugins")).unwrap();
+        let chain = vec![root.to_path_buf()];
+
+        let _off = ClaudePluginsEnv::off();
+        assert_eq!(
+            project_plugin_dirs_in(&chain),
+            vec![root.join(".grok/plugins")]
+        );
+        drop(_off);
+
+        let _on = ClaudePluginsEnv::on();
+        assert_eq!(
+            project_plugin_dirs_in(&chain),
+            vec![root.join(".grok/plugins"), root.join(".claude/plugins")]
         );
     }
 
@@ -1575,6 +1655,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn discover_project_claude_plugin_records_claude_origin() {
         // Unique name: discover_plugins also scans the dev machine's real
         // user dirs, and this test finds its plugin by name.
@@ -1590,6 +1671,17 @@ mod tests {
 
         let trust = TrustStore::load_from(tmp.path().join("trust"));
         let config = DiscoveryConfig::default();
+
+        // FORK DELTA: not discovered at all unless claude plugin compat is on.
+        let off = ClaudePluginsEnv::off();
+        let hidden = discover_plugins(Some(tmp.path()), &config, &trust, true);
+        assert!(
+            !hidden.iter().any(|p| p.manifest.name == name),
+            "project .claude plugin must be invisible by default"
+        );
+        drop(off);
+
+        let _on = ClaudePluginsEnv::on();
         let discovered = discover_plugins(Some(tmp.path()), &config, &trust, true);
         let p = discovered
             .iter()

@@ -127,7 +127,8 @@ pub(super) fn resolve_inspect_compat_with_env(
     effective_config: Result<&toml::Value, ()>,
     env_value: impl Fn(CompatCell) -> Option<bool>,
 ) -> ExternalCompatReport {
-    let defaults = CompatConfig::default();
+    // FORK DELTA: report against the same baseline the runtime resolves from.
+    let defaults = CompatConfig::FORK_DEFAULTS;
     let cells = COMPAT_CELLS
         .into_iter()
         .filter(|cell| cell.is_runtime_supported())
@@ -201,11 +202,20 @@ mod tests {
 
         assert!(!report.remote_settings_loaded);
         assert_eq!(report.cells.len(), 13);
+        // FORK DELTA: with nothing configured, `grok inspect` reports every
+        // claude cell disabled and every other cell enabled, all sourced from
+        // the default baseline.
         assert!(
             report
                 .cells
                 .iter()
-                .all(|cell| cell.enabled && cell.source == CompatSource::Default)
+                .all(|cell| cell.source == CompatSource::Default)
+        );
+        assert!(
+            report
+                .cells
+                .iter()
+                .all(|cell| cell.enabled == (cell.vendor != "claude"))
         );
         assert_eq!(
             report
@@ -217,7 +227,7 @@ mod tests {
             vec!["sessions"]
         );
         let session = entry(&report, "codex", "sessions");
-        assert_eq!(session.enabled, CompatConfig::default().codex.sessions);
+        assert_eq!(session.enabled, CompatConfig::FORK_DEFAULTS.codex.sessions);
         assert_eq!(session.source, CompatSource::Default);
         let json = serde_json::to_value(&report).unwrap();
         assert_eq!(json["remoteSettingsLoaded"], false);

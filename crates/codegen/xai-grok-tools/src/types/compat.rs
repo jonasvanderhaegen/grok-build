@@ -5,13 +5,15 @@
 //! ".claude", ".cursor"]` (and `RULES_DIRS` / `AGENT_FILENAMES`) across ~6
 //! call sites in three crates. This module now owns the canonical cell registry
 //! used by runtime resolution and diagnostics (env var → config TOML → remote
-//! setting → default ON).
+//! setting → baseline).
 //!
 //! Two forms:
 //! - [`CompatConfigToml`] — raw, parsed from the `[compat]` TOML section. Each
 //!   cell is `Option<bool>` so `None` falls through to the resolution chain.
-//! - [`CompatConfig`] — resolved plain bools consumed at runtime. Every cell
-//!   defaults on.
+//! - [`CompatConfig`] — resolved plain bools consumed at runtime. `Default` is
+//!   all-on ("scan everything", used by diagnostics); the baseline an
+//!   unconfigured session resolves to is [`CompatConfig::FORK_DEFAULTS`],
+//!   which has every `claude` cell OFF.
 
 use serde::{Deserialize, Serialize};
 
@@ -316,28 +318,64 @@ impl VendorCompat {
     }
 }
 
+impl VendorCompat {
+    /// Every surface on. Equivalent to [`VendorCompat::default`], in const form.
+    pub const ALL_ON: Self = Self {
+        skills: true,
+        rules: true,
+        agents: true,
+        mcps: true,
+        hooks: true,
+        sessions: true,
+    };
+
+    /// Every surface off. What `claude` resolves to in this fork when nothing
+    /// opts it back in.
+    pub const ALL_OFF: Self = Self {
+        skills: false,
+        rules: false,
+        agents: false,
+        mcps: false,
+        hooks: false,
+        sessions: false,
+    };
+}
+
 impl Default for VendorCompat {
     fn default() -> Self {
-        Self {
-            skills: true,
-            rules: true,
-            agents: true,
-            mcps: true,
-            hooks: true,
-            sessions: true,
-        }
+        Self::ALL_ON
     }
 }
 
 /// Resolved `[compat]` configuration threaded into compatibility consumers.
 ///
-/// Every cell defaults on. Codex's non-session cells are reserved and are not
-/// consumed by discovery.
+/// `Default` stays all-vendors-on: the codebase uses it as the "scan
+/// everything" value at diagnostic call sites (`grok inspect`, `mcp-doctor`)
+/// and in tests asserting legacy dir lists. The value that decides what an
+/// unconfigured session actually inherits is [`CompatConfig::FORK_DEFAULTS`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct CompatConfig {
     pub cursor: VendorCompat,
     pub claude: VendorCompat,
     pub codex: VendorCompat,
+}
+
+impl CompatConfig {
+    /// FORK DELTA: the baseline vendor-compat resolution starts from.
+    ///
+    /// Upstream ends its env → TOML → remote → default chain on all-on, so a
+    /// stock grok inherits Claude's skills, rules, CLAUDE.md, MCPs, hooks and
+    /// sessions with no opt-in anywhere. This fork ends that chain with every
+    /// `claude` cell OFF. Opting back in stays one line —
+    /// `[compat.claude] <surface> = true`, or `GROK_CLAUDE_<SURFACE>_ENABLED=1`
+    /// — because both are consulted before this baseline.
+    ///
+    /// Cursor and codex are untouched; this fork's quarrel is with one vendor.
+    pub const FORK_DEFAULTS: Self = Self {
+        cursor: VendorCompat::ALL_ON,
+        claude: VendorCompat::ALL_OFF,
+        codex: VendorCompat::ALL_ON,
+    };
 }
 
 impl CompatConfig {
@@ -470,6 +508,7 @@ mod tests {
             ]
         );
 
+        // `Default` stays all-on: diagnostics and legacy dir-list tests rely on it.
         let defaults = CompatConfig::default();
         for cell in COMPAT_CELLS {
             assert!(
@@ -484,6 +523,19 @@ mod tests {
             assert!(vendor.mcps && vendor.hooks);
             assert!(vendor.sessions);
         }
+
+        // FORK DELTA: the resolution baseline has claude off, others on.
+        let fork = CompatConfig::FORK_DEFAULTS;
+        for cell in COMPAT_CELLS {
+            assert_eq!(
+                fork.value(cell),
+                cell.vendor() != CompatVendor::Claude,
+                "FORK_DEFAULTS {}.{}",
+                cell.vendor().as_str(),
+                cell.surface().as_str()
+            );
+        }
+        assert_eq!(fork.claude, VendorCompat::ALL_OFF);
 
         assert_eq!(
             COMPAT_CELLS
